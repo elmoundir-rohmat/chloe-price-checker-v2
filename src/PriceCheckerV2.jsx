@@ -94,10 +94,11 @@ function parseSAP(arrayBuffer, refDate) {
   }));
 
   // Parse data rows
-  // data          = rows filtered by ALL business rules (used for runChecks)
-  // allActiveRows = rows filtered ONLY by isActiveAt + non-PLC15 (used for SAP DQ overlap detection)
+  // data    = rows filtered by ALL business rules (used for runChecks)
+  // dqRows  = ALL non-PLC15 rows with parseable dates, regardless of check date
+  //           → used for SAP DQ: detects present AND future date-range overlaps
   const data = [];
-  const allActiveRows = [];
+  const dqRows = [];
 
   const normDate = v => {
     if (!v) return null;
@@ -115,7 +116,6 @@ function parseSAP(arrayBuffer, refDate) {
 
     const vf = cols.validFrom !== undefined ? r[cols.validFrom] : null;
     const vt = cols.validTo   !== undefined ? r[cols.validTo]   : null;
-    if (!isActiveAt(vf, vt, refDate)) continue;
 
     const salesOrg   = String(r[cols.salesOrg]   ?? "").trim();
     const article    = String(r[cols.article]     ?? "").trim();
@@ -127,26 +127,31 @@ function parseSAP(arrayBuffer, refDate) {
     if (!salesOrg || !article) continue;
     const isGeneric = !pricingRef;
 
+    const validFrom = normDate(vf);
+    const validTo   = normDate(vt);
+
     const row = {
       salesOrg, article,
       pricingRef: pricingRef || null,
       plc, category,
       price: isNaN(price) ? null : price,
       currency, isGeneric,
-      validFrom: normDate(vf),
-      validTo:   normDate(vt),
+      validFrom, validTo,
     };
 
-    // allActiveRows: all rows active at checkDate, regardless of PLC 25 non-CW rule
-    // → used for SAP DQ overlap detection
-    allActiveRows.push(row);
+    // dqRows: all non-PLC15 rows with parseable dates (no isActiveAt filter)
+    // → enables detection of FUTURE overlaps not yet active at check date
+    if (validFrom && validTo) dqRows.push(row);
+
+    // For the main check: only keep rows active at check date
+    if (!isActiveAt(vf, vt, refDate)) continue;
 
     // data: also apply PLC 25 non-CW business rule (SKU rows ignored)
     if (plc === "25" && category !== CHILDRENWEAR && !isGeneric) continue;
     data.push(row);
   }
 
-  return { data, allActiveRows, colReport, warnings: missing };
+  return { data, dqRows, colReport, warnings: missing };
 }
 
 // ─── SFCC Parser ──────────────────────────────────────────────────────────────
@@ -520,29 +525,44 @@ export default function PriceCheckerV2() {
     const refDate = new Date(checkDateISO+"T00:00:00");
     setTimeout(() => {
       try {
-        const { data: sapData, allActiveRows: sapAllActive } = parseSAP(sapRaw, refDate);
+        const { data: sapData, dqRows: sapDqRows } = parseSAP(sapRaw, refDate);
 
         // Capture all Sales Orgs present in SAP at the check date (before any filtering)
         const allSapOrgs = [...new Set(sapData.map(r => r.salesOrg))].sort();
         setSapCoverage(allSapOrgs);
 
-        // ── SAP DQ: detect (salesOrg + article) pairs with multiple active rows ──
-        // Uses allActiveRows (before PLC 25 non-CW rule) to catch ALL overlaps,
-        // even when one of the conflicting rows would be filtered by business rules.
-        const sapGrouped = {};
-        sapAllActive.forEach(row => {
+        // ── SAP DQ: detect date-range overlaps (present AND future) ──
+        // Group ALL non-PLC15 rows (dqRows) by salesOrg + article, then check pairwise
+        // if any 2 rows for the same article have overlapping valid periods.
+        // Condition: max(from1,from2) <= min(to1,to2) AND overlap not fully in the past
+        const dqGrouped = {};
+        sapDqRows.forEach(row => {
           const key = `${row.salesOrg}__${row.article}`;
-          if (!sapGrouped[key]) sapGrouped[key] = [];
-          sapGrouped[key].push(row);
+          if (!dqGrouped[key]) dqGrouped[key] = [];
+          dqGrouped[key].push(row);
         });
         const newSapDqIssues = [];
-        for (const rows of Object.values(sapGrouped)) {
-          if (rows.length > 1) {
+        for (const rows of Object.values(dqGrouped)) {
+          if (rows.length < 2) continue;
+          const conflicting = new Set();
+          for (let i = 0; i < rows.length; i++) {
+            for (let j = i + 1; j < rows.length; j++) {
+              const a = rows[i], b = rows[j];
+              const overlapStart = a.validFrom >= b.validFrom ? a.validFrom : b.validFrom;
+              const overlapEnd   = a.validTo   <= b.validTo   ? a.validTo   : b.validTo;
+              // Overlap exists and is not fully expired before check date
+              if (overlapStart <= overlapEnd && overlapEnd >= refDate) {
+                conflicting.add(i);
+                conflicting.add(j);
+              }
+            }
+          }
+          if (conflicting.size > 0) {
             newSapDqIssues.push({
               salesOrg: rows[0].salesOrg,
               article:  rows[0].article,
               plc:      rows[0].plc,
-              rows,
+              rows: [...conflicting].map(idx => rows[idx]),
             });
           }
         }
@@ -888,9 +908,9 @@ export default function PriceCheckerV2() {
                         ⚠ Data Quality — Lignes SAP chevauchantes
                       </div>
                       <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#ccc", lineHeight:"1.6" }}>
-                        <strong style={{ color:"#F0A030", fontFamily:"'Cormorant Garamond',serif", fontSize:"16px", fontWeight:300 }}>{sapDqIssues.length}</strong> article(s) ont plusieurs lignes SAP actives simultanément à la date de check.
-                        Ces articles sont comptés <strong style={{ color:"#F0A030" }}>plusieurs fois</strong> dans les KPIs sans déduplication.
-                        La ligne avec la <strong>Valid From la plus récente</strong> a été retenue pour le check.
+                        <strong style={{ color:"#F0A030", fontFamily:"'Cormorant Garamond',serif", fontSize:"16px", fontWeight:300 }}>{sapDqIssues.length}</strong> article(s) ont des plages de dates qui se chevauchent dans SAP.
+                        Certains chevauchements sont <strong style={{ color:"#F0A030" }}>futurs</strong> (pas encore actifs au {checkDateLabel}) mais impacteront les prix dès leur activation.
+                        La ligne avec la <strong>Valid From la plus récente</strong> est retenue pour le check actuel.
                       </div>
                     </div>
                     <ExportMenuRaw data={sapDqExportData} label="sap_chevauchements" count={sapDqIssues.length} />
