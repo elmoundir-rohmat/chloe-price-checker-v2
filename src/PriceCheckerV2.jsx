@@ -119,12 +119,22 @@ function parseSAP(arrayBuffer, refDate) {
     // PLC 25 non-CW: only keep generic rows (SKU rows ignored)
     if (plc === "25" && category !== CHILDRENWEAR && !isGeneric) continue;
 
+    // Normalise dates to Date objects for SAP DQ overlap detection
+    const normDate = v => {
+      if (!v) return null;
+      const d = v instanceof Date ? new Date(v) : new Date(v);
+      d.setHours(0, 0, 0, 0);
+      return d;
+    };
+
     data.push({
       salesOrg, article,
       pricingRef: pricingRef || null,
       plc, category,
       price: isNaN(price) ? null : price,
       currency, isGeneric,
+      validFrom: normDate(vf),
+      validTo:   normDate(vt),
     });
   }
 
@@ -167,12 +177,13 @@ function parseSFCC(xmlText) {
 // At a given checkDate, resolve each product's effective price:
 //   1. Collect all dated entries active at checkDate
 //   2. If multiple active dated entries → DQ issue (overlapping)
+//      → type PRIX_DIFFERENTS if prices differ, PRIX_IDENTIQUES otherwise
 //   3. If exactly one active dated entry → use it (priority over continuous)
 //   4. If no active dated entry → use continuous price (no dates)
 //   5. If neither → absent
-// Returns { prices: {pid: price}, dqIssues: [{pid, entries}] }
+// Returns { prices: {pid: price}, dqIssues: [{pid, salesOrg, entries, type}] }
 function resolveSFCCPrices(rawPrices, checkDate) {
-  const prices = {};
+  const resolvedPrices = {};
   const dqIssues = [];
   const d0 = new Date(checkDate); d0.setHours(12,0,0,0);
 
@@ -184,21 +195,26 @@ function resolveSFCCPrices(rawPrices, checkDate) {
     const activeDated = dated.filter(e => e.from <= d0 && d0 <= e.to);
 
     if (activeDated.length > 1) {
-      // DQ issue: multiple dated prices active at same time
-      dqIssues.push({ pid, entries: activeDated });
-      // Use first one anyway, flag it
-      prices[pid] = activeDated[0].price;
+      // Classify: same price across all overlapping entries, or different?
+      const priceVals = activeDated.map(e => e.price);
+      const allSame   = priceVals.every(p => Math.abs(p - priceVals[0]) < EPS);
+      dqIssues.push({
+        pid,
+        entries: activeDated,
+        type: allSame ? "PRIX_IDENTIQUES" : "PRIX_DIFFERENTS",
+      });
+      // Use entry with most recent "from" date as the effective price
+      const sorted = [...activeDated].sort((a, b) => b.from - a.from);
+      resolvedPrices[pid] = sorted[0].price;
     } else if (activeDated.length === 1) {
-      // One active dated price — use it (priority)
-      prices[pid] = activeDated[0].price;
+      resolvedPrices[pid] = activeDated[0].price;
     } else if (continuous.length > 0) {
-      // No active dated price — fall back to continuous
-      prices[pid] = continuous[0].price;
+      resolvedPrices[pid] = continuous[0].price;
     }
     // else: no price at this date → pid not added → KO_MISSING
   }
 
-  return { prices, dqIssues };
+  return { prices: resolvedPrices, dqIssues };
 }
 
 // ─── Check Engine ─────────────────────────────────────────────────────────────
@@ -260,6 +276,25 @@ function doCSV(rows, label, checkDateLabel) {
   URL.revokeObjectURL(url);
 }
 
+// Raw export (pre-formatted DQ rows, no schema transform)
+function doXLSXRaw(data, label) {
+  if (!data.length) return;
+  const ws = XLSX.utils.json_to_sheet(data);
+  ws["!cols"] = Object.keys(data[0]).map(() => ({ wch:22 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "DQ Export");
+  XLSX.writeFile(wb, `chloe_dq_${label}_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+function doCSVRaw(data, label) {
+  if (!data.length) return;
+  const hs = Object.keys(data[0]);
+  const esc = v => `"${String(v).replace(/"/g,'""')}"`;
+  const lines = [hs.map(esc).join(","), ...data.map(r => hs.map(h=>esc(r[h])).join(","))];
+  const url = URL.createObjectURL(new Blob([lines.join("\n")], { type:"text/csv;charset=utf-8;" }));
+  Object.assign(document.createElement("a"), { href:url, download:`chloe_dq_${label}_${new Date().toISOString().slice(0,10)}.csv` }).click();
+  URL.revokeObjectURL(url);
+}
+
 // ─── UI Components ────────────────────────────────────────────────────────────
 function KpiCard({ label, value, sub, color, onClick, active }) {
   return (
@@ -286,6 +321,33 @@ function ExportMenu({ rows, label, checkDateLabel, small }) {
           {[
             { ext:"XLSX", icon:"📊", fn:()=>{ doXLSX(rows,label,checkDateLabel); setOpen(false); } },
             { ext:"CSV",  icon:"📄", fn:()=>{ doCSV(rows,label,checkDateLabel);  setOpen(false); } },
+          ].map(({ ext, icon, fn }) => (
+            <button key={ext} onClick={fn}
+              style={{ display:"block", width:"100%", background:"transparent", border:"none", borderBottom:"1px solid #1a1a1a", color:"#ccc", padding:"9px 14px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", letterSpacing:".1em", textTransform:"uppercase", cursor:"pointer", textAlign:"left" }}
+              onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
+              onMouseLeave={e=>e.currentTarget.style.background="transparent"}
+            >{icon} {ext}</button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Export menu for pre-formatted DQ rows (bypasses toExportRows schema transform)
+function ExportMenuRaw({ data, label, count }) {
+  const [open, setOpen] = useState(false);
+  const s = { background:"transparent", border:"1px solid #C9A97A55", color:"#C9A97A", padding:"5px 10px", fontFamily:"'Montserrat',sans-serif", fontSize:"8px", letterSpacing:".12em", cursor:"pointer", textTransform:"uppercase", display:"flex", alignItems:"center", gap:"4px" };
+  return (
+    <div style={{ position:"relative", display:"inline-block" }}>
+      <button style={s} onClick={()=>setOpen(o=>!o)}>
+        ↓ Export ({count}) <span style={{ opacity:.5 }}>{open?"▲":"▼"}</span>
+      </button>
+      {open && (
+        <div style={{ position:"absolute", right:0, top:"100%", marginTop:"2px", background:"#111", border:"1px solid #2a2a2a", zIndex:99, minWidth:"130px" }}>
+          {[
+            { ext:"XLSX", icon:"📊", fn:()=>{ doXLSXRaw(data,label); setOpen(false); } },
+            { ext:"CSV",  icon:"📄", fn:()=>{ doCSVRaw(data,label);  setOpen(false); } },
           ].map(({ ext, icon, fn }) => (
             <button key={ext} onClick={fn}
               style={{ display:"block", width:"100%", background:"transparent", border:"none", borderBottom:"1px solid #1a1a1a", color:"#ccc", padding:"9px 14px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", letterSpacing:".1em", textTransform:"uppercase", cursor:"pointer", textAlign:"left" }}
@@ -383,6 +445,7 @@ export default function PriceCheckerV2() {
   const [appliedDate,  setAppliedDate]  = useState(null);
   const [sapCoverage,  setSapCoverage]  = useState(null);
   const [dqIssues,     setDqIssues]     = useState([]);
+  const [sapDqIssues,  setSapDqIssues]  = useState([]);
   const [loading,      setLoading]      = useState(false);
   const [loadMsg,      setLoadMsg]      = useState("");
   const [error,        setError]        = useState("");
@@ -450,11 +513,41 @@ export default function PriceCheckerV2() {
     setTimeout(() => {
       try {
         const { data: sapData } = parseSAP(sapRaw, refDate);
+
         // Capture all Sales Orgs present in SAP at the check date (before any filtering)
         const allSapOrgs = [...new Set(sapData.map(r => r.salesOrg))].sort();
         setSapCoverage(allSapOrgs);
-        // Resolve SFCC prices at check date (dated priority > continuous fallback)
-        const sfccByOrg = {};
+
+        // ── SAP DQ: detect (salesOrg + article) pairs with multiple active rows ──
+        const sapGrouped = {};
+        sapData.forEach(row => {
+          const key = `${row.salesOrg}__${row.article}`;
+          if (!sapGrouped[key]) sapGrouped[key] = [];
+          sapGrouped[key].push(row);
+        });
+        const newSapDqIssues = [];
+        const dedupedSapData = [];
+        for (const rows of Object.values(sapGrouped)) {
+          if (rows.length > 1) {
+            newSapDqIssues.push({
+              salesOrg: rows[0].salesOrg,
+              article:  rows[0].article,
+              plc:      rows[0].plc,
+              rows,
+            });
+            // Keep the row with the most recent validFrom (most specific)
+            const best = rows.reduce((a, b) =>
+              (a.validFrom && b.validFrom && a.validFrom >= b.validFrom) ? a : b
+            );
+            dedupedSapData.push(best);
+          } else {
+            dedupedSapData.push(rows[0]);
+          }
+        }
+        setSapDqIssues(newSapDqIssues);
+
+        // ── SFCC DQ: resolve prices, collect overlaps per Sales Org ──
+        const sfccByOrg  = {};
         const allDqIssues = [];
         xmlFiles.forEach(x => {
           const org = x.salesOrgOverride || x.salesOrg;
@@ -464,9 +557,12 @@ export default function PriceCheckerV2() {
           dqIssues.forEach(issue => allDqIssues.push({ ...issue, salesOrg: org }));
         });
         setDqIssues(allDqIssues);
-        setResults(runChecks(sapData, sfccByOrg));
+
+        // Run checks on de-duplicated SAP data
+        setResults(runChecks(dedupedSapData, sfccByOrg));
         setAppliedDate(refDate);
-        setFilterOrg("all"); setFilterStatus("all"); setSearch(""); setPage(0); setDqIssues([]); setError("");
+        setFilterOrg("all"); setFilterStatus("all"); setSearch(""); setPage(0);
+        setError("");
       } catch(err) { setError("Erreur : "+err.message); }
       setLoading(false);
     }, 50);
@@ -535,7 +631,7 @@ export default function PriceCheckerV2() {
           )}
           {results && (
             <>
-              <button onClick={()=>{ setResults(null); setAppliedDate(null); setSapCoverage(null); setDqIssues([]); }}
+              <button onClick={()=>{ setResults(null); setAppliedDate(null); setSapCoverage(null); setDqIssues([]); setSapDqIssues([]); }}
                 style={{ background:"transparent", border:"1px solid #1e1e1e", color:"#555", padding:"7px 14px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".15em", cursor:"pointer", textTransform:"uppercase" }}>
                 ← Reset
               </button>
@@ -715,14 +811,31 @@ export default function PriceCheckerV2() {
               </div>
             )}
 
-            <div style={{ display:"grid", gridTemplateColumns:`repeat(${dqIssues.length>0?5:4},1fr)`, gap:"8px", marginBottom:"8px" }}>
+            <div style={{ display:"grid", gridTemplateColumns:`repeat(${4+(dqIssues.length>0?1:0)+(sapDqIssues.length>0?1:0)},1fr)`, gap:"8px", marginBottom:"8px" }}>
               <KpiCard label="Total vérifiés"      value={stats.total.toLocaleString()}  color="#F0EBE0" sub={`Actifs au ${checkDateLabel}`} />
               <KpiCard label="PASS"                value={stats.pass.toLocaleString()}   color="#4CAF7A" sub={`${((stats.pass/stats.total)*100).toFixed(1)}% alignés`} onClick={()=>{setFilterStatus("PASS");setPage(0);}} active={filterStatus==="PASS"} />
               <KpiCard label="KO — prix différent" value={stats.koDiff.toLocaleString()} color="#E05252" sub="présent mais mauvais prix"    onClick={()=>{setFilterStatus("KO_DIFF");setPage(0);}} active={filterStatus==="KO_DIFF"} />
               <KpiCard label="KO — absent SFCC"    value={stats.koMiss.toLocaleString()} color="#E052A0" sub="manquant dans pricebook"       onClick={()=>{setFilterStatus("KO_MISSING");setPage(0);}} active={filterStatus==="KO_MISSING"} />
-              {dqIssues.length > 0 && (
-                <KpiCard label="⚠ DQ — prix chevauchants SFCC" value={dqIssues.length.toLocaleString()} color="#F0A030" sub="plusieurs prix datés actifs" />
+              {sapDqIssues.length > 0 && (
+                <KpiCard
+                  label="⚠ DQ SAP — lignes chevauchantes"
+                  value={sapDqIssues.length.toLocaleString()}
+                  color="#F0A030"
+                  sub="articles comptés plusieurs fois"
+                />
               )}
+              {dqIssues.length > 0 && (() => {
+                const nDiff = dqIssues.filter(d => d.type === "PRIX_DIFFERENTS").length;
+                const nSame = dqIssues.filter(d => d.type === "PRIX_IDENTIQUES").length;
+                return (
+                  <KpiCard
+                    label="⚠ DQ SFCC — prix chevauchants"
+                    value={dqIssues.length.toLocaleString()}
+                    color={nDiff > 0 ? "#E05252" : "#F0A030"}
+                    sub={nDiff > 0 ? `dont ${nDiff} prix différents` : `${nSame} prix identiques`}
+                  />
+                );
+              })()}
             </div>
 
             <div style={{ display:"flex", height:"2px", marginBottom:"16px", gap:"1px" }}>
@@ -731,38 +844,141 @@ export default function PriceCheckerV2() {
               <div style={{ flex:stats.koMiss, background:"#E052A0" }} />
             </div>
 
-            {/* DQ Issues panel */}
-            {dqIssues.length > 0 && (
-              <div style={{ background:"#1e1500", border:"1px solid #F0A03033", padding:"12px 16px", marginBottom:"14px" }}>
-                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:"10px" }}>
-                  <div>
-                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#F0A030", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"4px" }}>
-                      ⚠ Data Quality — Prix SFCC chevauchants
+            {/* DQ SAP panel */}
+            {sapDqIssues.length > 0 && (() => {
+              const sapDqExportData = sapDqIssues.map(d => ({
+                "Date de check":       checkDateLabel,
+                "Sales Org":           d.salesOrg,
+                "Article":             d.article,
+                "PLC":                 d.plc,
+                "Ligne 1 Prix":        d.rows[0]?.price ?? "",
+                "Ligne 1 Valid From":  d.rows[0]?.validFrom ? fmtDate(d.rows[0].validFrom) : "",
+                "Ligne 1 Valid To":    d.rows[0]?.validTo   ? fmtDate(d.rows[0].validTo)   : "",
+                "Ligne 2 Prix":        d.rows[1]?.price ?? "",
+                "Ligne 2 Valid From":  d.rows[1]?.validFrom ? fmtDate(d.rows[1].validFrom) : "",
+                "Ligne 2 Valid To":    d.rows[1]?.validTo   ? fmtDate(d.rows[1].validTo)   : "",
+              }));
+              return (
+                <div style={{ background:"#130e00", border:"1px solid #F0A03044", padding:"14px 16px", marginBottom:"10px" }}>
+                  <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:"10px", marginBottom:"10px" }}>
+                    <div>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#F0A030", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"4px" }}>
+                        ⚠ Data Quality — Lignes SAP chevauchantes
+                      </div>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#ccc", lineHeight:"1.6" }}>
+                        <strong style={{ color:"#F0A030", fontFamily:"'Cormorant Garamond',serif", fontSize:"16px", fontWeight:300 }}>{sapDqIssues.length}</strong> article(s) ont plusieurs lignes SAP actives simultanément à la date de check.
+                        Ces articles sont comptés <strong style={{ color:"#F0A030" }}>plusieurs fois</strong> dans les KPIs sans déduplication.
+                        La ligne avec la <strong>Valid From la plus récente</strong> a été retenue pour le check.
+                      </div>
                     </div>
-                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#ccc" }}>
-                      <strong style={{ color:"#F0A030", fontFamily:"'Cormorant Garamond',serif", fontSize:"16px", fontWeight:300 }}>{dqIssues.length}</strong> produit(s) ont plusieurs prix datés actifs simultanément dans SFCC à la date de check. Le premier prix trouvé a été utilisé.
-                    </div>
+                    <ExportMenuRaw data={sapDqExportData} label="sap_chevauchements" count={sapDqIssues.length} />
                   </div>
-                  <ExportMenu
-                    rows={dqIssues.map(d => ({
-                      salesOrg: d.salesOrg, article: d.pid,
-                      entries: d.entries.map(e => `${e.price} (${e.from?.toISOString().slice(0,10)} → ${e.to?.toISOString().slice(0,10)})`).join(" | ")
-                    }))}
-                    label="dq_chevauchements"
-                    checkDateLabel={checkDateLabel}
-                    small
-                  />
+                  <div style={{ overflowX:"auto" }}>
+                    <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"10px" }}>
+                      <thead>
+                        <tr style={{ background:"#0c0c0c", borderBottom:"1px solid #1a1a1a" }}>
+                          {["Sales Org","Article","PLC","Ligne 1 Prix","L1 Valid From","L1 Valid To","Ligne 2 Prix","L2 Valid From","L2 Valid To"].map(h=>(
+                            <th key={h} style={{ padding:"6px 10px", fontFamily:"'Montserrat',sans-serif", fontSize:"8px", letterSpacing:".1em", color:"#F0A030", textTransform:"uppercase", fontWeight:500, textAlign:"left", whiteSpace:"nowrap" }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sapDqIssues.slice(0,15).map((d,i) => (
+                          <tr key={i} style={{ borderBottom:"1px solid #111" }}>
+                            <td style={{ padding:"5px 10px", fontFamily:"'Montserrat',sans-serif", color:"#C9A97A88" }}>{d.salesOrg}</td>
+                            <td style={{ padding:"5px 10px", fontFamily:"'Montserrat',sans-serif", color:"#ddd", whiteSpace:"nowrap" }}>{d.article}</td>
+                            <td style={{ padding:"5px 10px", fontFamily:"'Montserrat',sans-serif", color:"#666" }}>{d.plc}</td>
+                            {[0,1].map(idx => (
+                              <>
+                                <td key={`p${idx}`} style={{ padding:"5px 10px", fontFamily:"'Montserrat',sans-serif", color: idx===0?"#4CAF7A":"#F0A030", fontWeight:500 }}>{d.rows[idx]?.price != null ? fmt(d.rows[idx].price) : "—"}</td>
+                                <td key={`f${idx}`} style={{ padding:"5px 10px", fontFamily:"'Montserrat',sans-serif", color:"#555", whiteSpace:"nowrap" }}>{d.rows[idx]?.validFrom ? fmtDate(d.rows[idx].validFrom) : "—"}</td>
+                                <td key={`t${idx}`} style={{ padding:"5px 10px", fontFamily:"'Montserrat',sans-serif", color:"#555", whiteSpace:"nowrap" }}>{d.rows[idx]?.validTo   ? fmtDate(d.rows[idx].validTo)   : "—"}</td>
+                              </>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {sapDqIssues.length > 15 && (
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555", marginTop:"8px" }}>
+                      +{sapDqIssues.length - 15} autres — voir export complet
+                    </div>
+                  )}
                 </div>
-                <div style={{ marginTop:"10px", display:"flex", flexWrap:"wrap", gap:"5px" }}>
-                  {dqIssues.slice(0,20).map(d => (
-                    <span key={d.pid+d.salesOrg} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#111", border:"1px solid #F0A03033", color:"#F0A030", padding:"2px 8px" }}>
-                      {d.salesOrg} · {d.pid}
-                    </span>
-                  ))}
-                  {dqIssues.length > 20 && <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555" }}>+{dqIssues.length-20} autres</span>}
+              );
+            })()}
+
+            {/* DQ SFCC panel — deux sections : prix différents (critique) + identiques (bruit) */}
+            {dqIssues.length > 0 && (() => {
+              const diff = dqIssues.filter(d => d.type === "PRIX_DIFFERENTS");
+              const same = dqIssues.filter(d => d.type === "PRIX_IDENTIQUES");
+              const sfccDqExportData = dqIssues.map(d => ({
+                "Date de check":  checkDateLabel,
+                "Sales Org":      d.salesOrg,
+                "Article":        d.pid,
+                "Prix 1":         d.entries[0]?.price ?? "",
+                "Date début 1":   d.entries[0]?.from ? fmtDate(d.entries[0].from) : "",
+                "Date fin 1":     d.entries[0]?.to   ? fmtDate(d.entries[0].to)   : "",
+                "Prix 2":         d.entries[1]?.price ?? "",
+                "Date début 2":   d.entries[1]?.from ? fmtDate(d.entries[1].from) : "",
+                "Date fin 2":     d.entries[1]?.to   ? fmtDate(d.entries[1].to)   : "",
+                "Type":           d.type,
+              }));
+              return (
+                <div style={{ background:"#120800", border:"1px solid #E0525233", padding:"14px 16px", marginBottom:"10px" }}>
+                  <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", flexWrap:"wrap", gap:"10px", marginBottom:"12px" }}>
+                    <div>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#F0A030", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"4px" }}>
+                        ⚠ Data Quality — Prix SFCC chevauchants
+                      </div>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#ccc" }}>
+                        <strong style={{ color:"#F0A030", fontFamily:"'Cormorant Garamond',serif", fontSize:"16px", fontWeight:300 }}>{dqIssues.length}</strong> produit(s) ont plusieurs prix datés actifs simultanément dans SFCC.
+                        Le prix avec la date de début la plus récente a été retenu pour le check.
+                      </div>
+                    </div>
+                    <ExportMenuRaw data={sfccDqExportData} label="sfcc_chevauchements" count={dqIssues.length} />
+                  </div>
+
+                  {/* Section 1 — Prix différents (critique) */}
+                  {diff.length > 0 && (
+                    <div style={{ marginBottom:"12px" }}>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#E05252", letterSpacing:".18em", textTransform:"uppercase", marginBottom:"6px", display:"flex", alignItems:"center", gap:"8px" }}>
+                        <span style={{ background:"#E0525222", border:"1px solid #E0525244", padding:"2px 7px" }}>⛔ Prix différents — {diff.length} produit(s) — à corriger en urgence</span>
+                      </div>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:"4px" }}>
+                        {diff.slice(0,30).map(d => (
+                          <span key={d.pid+d.salesOrg} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#1e0a0a", border:"1px solid #E0525255", color:"#E05252", padding:"3px 8px" }} title={d.entries.map(e=>`${e.price} (${fmtDate(e.from)}→${fmtDate(e.to)})`).join(" | ")}>
+                            {d.salesOrg} · {d.pid}
+                            <span style={{ color:"#E0525288", marginLeft:"4px", fontSize:"8px" }}>
+                              {d.entries.map(e=>fmt(e.price)).join(" / ")}
+                            </span>
+                          </span>
+                        ))}
+                        {diff.length > 30 && <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555" }}>+{diff.length-30} autres</span>}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Section 2 — Prix identiques (bruit de config) */}
+                  {same.length > 0 && (
+                    <div>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#C9A97A", letterSpacing:".18em", textTransform:"uppercase", marginBottom:"6px", display:"flex", alignItems:"center", gap:"8px" }}>
+                        <span style={{ background:"#C9A97A11", border:"1px solid #C9A97A33", padding:"2px 7px" }}>⚠ Prix identiques — {same.length} produit(s) — bruit de configuration, pas d'impact prix</span>
+                      </div>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:"4px" }}>
+                        {same.slice(0,30).map(d => (
+                          <span key={d.pid+d.salesOrg} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#111", border:"1px solid #C9A97A22", color:"#C9A97A77", padding:"3px 8px" }}>
+                            {d.salesOrg} · {d.pid}
+                          </span>
+                        ))}
+                        {same.length > 30 && <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555" }}>+{same.length-30} autres</span>}
+                      </div>
+                    </div>
+                  )}
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             <div style={{ marginBottom:"14px", overflowX:"auto" }}>
               <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
