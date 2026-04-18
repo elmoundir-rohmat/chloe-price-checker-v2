@@ -94,7 +94,18 @@ function parseSAP(arrayBuffer, refDate) {
   }));
 
   // Parse data rows
+  // data          = rows filtered by ALL business rules (used for runChecks)
+  // allActiveRows = rows filtered ONLY by isActiveAt + non-PLC15 (used for SAP DQ overlap detection)
   const data = [];
+  const allActiveRows = [];
+
+  const normDate = v => {
+    if (!v) return null;
+    const d = v instanceof Date ? new Date(v) : new Date(v);
+    d.setHours(0, 0, 0, 0);
+    return isNaN(d.getTime()) ? null : d;
+  };
+
   for (let i = 1; i < allRows.length; i++) {
     const r = allRows[i];
     if (!r?.[cols.salesOrg] && !r?.[cols.article]) continue;
@@ -116,18 +127,7 @@ function parseSAP(arrayBuffer, refDate) {
     if (!salesOrg || !article) continue;
     const isGeneric = !pricingRef;
 
-    // PLC 25 non-CW: only keep generic rows (SKU rows ignored)
-    if (plc === "25" && category !== CHILDRENWEAR && !isGeneric) continue;
-
-    // Normalise dates to Date objects for SAP DQ overlap detection
-    const normDate = v => {
-      if (!v) return null;
-      const d = v instanceof Date ? new Date(v) : new Date(v);
-      d.setHours(0, 0, 0, 0);
-      return d;
-    };
-
-    data.push({
+    const row = {
       salesOrg, article,
       pricingRef: pricingRef || null,
       plc, category,
@@ -135,10 +135,18 @@ function parseSAP(arrayBuffer, refDate) {
       currency, isGeneric,
       validFrom: normDate(vf),
       validTo:   normDate(vt),
-    });
+    };
+
+    // allActiveRows: all rows active at checkDate, regardless of PLC 25 non-CW rule
+    // → used for SAP DQ overlap detection
+    allActiveRows.push(row);
+
+    // data: also apply PLC 25 non-CW business rule (SKU rows ignored)
+    if (plc === "25" && category !== CHILDRENWEAR && !isGeneric) continue;
+    data.push(row);
   }
 
-  return { data, colReport, warnings: missing };
+  return { data, allActiveRows, colReport, warnings: missing };
 }
 
 // ─── SFCC Parser ──────────────────────────────────────────────────────────────
@@ -512,21 +520,22 @@ export default function PriceCheckerV2() {
     const refDate = new Date(checkDateISO+"T00:00:00");
     setTimeout(() => {
       try {
-        const { data: sapData } = parseSAP(sapRaw, refDate);
+        const { data: sapData, allActiveRows: sapAllActive } = parseSAP(sapRaw, refDate);
 
         // Capture all Sales Orgs present in SAP at the check date (before any filtering)
         const allSapOrgs = [...new Set(sapData.map(r => r.salesOrg))].sort();
         setSapCoverage(allSapOrgs);
 
         // ── SAP DQ: detect (salesOrg + article) pairs with multiple active rows ──
+        // Uses allActiveRows (before PLC 25 non-CW rule) to catch ALL overlaps,
+        // even when one of the conflicting rows would be filtered by business rules.
         const sapGrouped = {};
-        sapData.forEach(row => {
+        sapAllActive.forEach(row => {
           const key = `${row.salesOrg}__${row.article}`;
           if (!sapGrouped[key]) sapGrouped[key] = [];
           sapGrouped[key].push(row);
         });
         const newSapDqIssues = [];
-        const dedupedSapData = [];
         for (const rows of Object.values(sapGrouped)) {
           if (rows.length > 1) {
             newSapDqIssues.push({
@@ -535,7 +544,21 @@ export default function PriceCheckerV2() {
               plc:      rows[0].plc,
               rows,
             });
-            // Keep the row with the most recent validFrom (most specific)
+          }
+        }
+        setSapDqIssues(newSapDqIssues);
+
+        // ── Deduplicate sapData for runChecks ──
+        // If 2 rows survive all filters for the same (salesOrg+article), keep the most recent validFrom
+        const checkGrouped = {};
+        sapData.forEach(row => {
+          const key = `${row.salesOrg}__${row.article}`;
+          if (!checkGrouped[key]) checkGrouped[key] = [];
+          checkGrouped[key].push(row);
+        });
+        const dedupedSapData = [];
+        for (const rows of Object.values(checkGrouped)) {
+          if (rows.length > 1) {
             const best = rows.reduce((a, b) =>
               (a.validFrom && b.validFrom && a.validFrom >= b.validFrom) ? a : b
             );
@@ -544,7 +567,6 @@ export default function PriceCheckerV2() {
             dedupedSapData.push(rows[0]);
           }
         }
-        setSapDqIssues(newSapDqIssues);
 
         // ── SFCC DQ: resolve prices, collect overlaps per Sales Org ──
         const sfccByOrg  = {};
