@@ -909,7 +909,7 @@ export default function PriceCheckerV2() {
                       </div>
                       <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#ccc", lineHeight:"1.6" }}>
                         <strong style={{ color:"#F0A030", fontFamily:"'Cormorant Garamond',serif", fontSize:"16px", fontWeight:300 }}>{sapDqIssues.length}</strong> article(s) ont des plages de dates qui se chevauchent dans SAP.
-                        Certains chevauchements sont <strong style={{ color:"#F0A030" }}>futurs</strong> (pas encore actifs au {checkDateLabel}) mais impacteront les prix dès leur activation.
+                        Certains chevauchements peuvent être dans le futur, pouvant impacter les prix dès leur activation.
                         La ligne avec la <strong>Valid From la plus récente</strong> est retenue pour le check actuel.
                       </div>
                     </div>
