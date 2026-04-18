@@ -1,0 +1,866 @@
+import { useState, useCallback, useMemo } from "react";
+import * as XLSX from "xlsx";
+
+const CHILDRENWEAR = "Childrenwear Chloé";
+const EPS = 0.01;
+const PAGE_SIZE = 200;
+
+// ─── Column mapping ───────────────────────────────────────────────────────────
+// Maps internal field names to possible header labels in the SAP Excel.
+// Add synonyms/variants here if SAP changes the column name in future exports.
+const COLUMN_MAP = {
+  salesOrg:   ["Sales Organization", "Sales Org.", "Sales Org", "SalesOrg"],
+  article:    ["Article", "Article ID", "SKU", "Material"],
+  pricingRef: ["Pricing Ref. Artl", "Pricing Ref", "Pricing Ref Artl", "Generic"],
+  plc:        ["Prod.Life Cycle", "Prod.Life", "PLC", "Prod. Life", "Product Life", "Prod Life"],
+  category:   ["Mdse Catgry Desc.", "Mdse Catgry Desc", "Category", "Merchandise Category Desc"],
+  validFrom:  ["Valid From", "ValidFrom", "Valid from"],
+  validTo:    ["Valid To", "ValidTo", "Valid to"],
+  price:      ["ZRSP Rate", "Price", "Amount", "Rate"],
+  currency:   ["Currency ZRSP", "Currency Z", "Currency", "Curr"],
+};
+
+// Finds the index of the first matching header (case-insensitive)
+function findColIndex(headers, candidates) {
+  for (const candidate of candidates) {
+    const idx = headers.findIndex(h => h.trim().toLowerCase() === candidate.toLowerCase());
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+// Resolves all column indices from the header row
+// Returns { cols, missing } where missing = list of field names not found
+function resolveColumns(headers) {
+  const cols = {};
+  const missing = [];
+  for (const [field, candidates] of Object.entries(COLUMN_MAP)) {
+    const idx = findColIndex(headers, candidates);
+    if (idx === -1) missing.push({ field, tried: candidates });
+    else cols[field] = idx;
+  }
+  return { cols, missing };
+}
+
+// ─── Date helper ──────────────────────────────────────────────────────────────
+function isActiveAt(vf, vt, refDate) {
+  if (!vf || !vt) return false;
+  const d0 = new Date(refDate); d0.setHours(0,0,0,0);
+  const makeD = v => { const d = v instanceof Date ? new Date(v) : new Date(v); d.setHours(0,0,0,0); return d; };
+  return makeD(vf) <= d0 && d0 <= makeD(vt);
+}
+
+const fmt = v => (v !== null && v !== undefined && !isNaN(v)) ? Number(v).toFixed(2) : "—";
+
+function fmtDate(d) {
+  if (!d) return "";
+  const dt = d instanceof Date ? d : new Date(d);
+  return `${String(dt.getDate()).padStart(2,"0")}/${String(dt.getMonth()+1).padStart(2,"0")}/${dt.getFullYear()}`;
+}
+
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+
+// ─── SAP Parser ───────────────────────────────────────────────────────────────
+// Returns { data, colReport } where colReport describes resolved columns
+function parseSAP(arrayBuffer, refDate) {
+  const wb = XLSX.read(arrayBuffer, { type:"array", cellDates:true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const allRows = XLSX.utils.sheet_to_json(ws, { header:1 });
+  if (!allRows.length) throw new Error("Fichier SAP vide.");
+
+  // Detect header row (first non-empty row)
+  const headerRow = allRows[0].map(h => String(h ?? "").trim());
+
+  // Resolve columns by name
+  const { cols, missing } = resolveColumns(headerRow);
+
+  // If critical columns are missing, throw with details
+  const critical = ["salesOrg","article","plc","validFrom","validTo","price"];
+  const criticalMissing = missing.filter(m => critical.includes(m.field));
+  if (criticalMissing.length > 0) {
+    const details = criticalMissing.map(m => `"${m.field}" (essayé: ${m.tried.join(", ")})`).join(" | ");
+    throw new Error(`Colonnes introuvables dans le fichier SAP : ${details}\n\nEn-têtes détectés : ${headerRow.filter(Boolean).join(", ")}`);
+  }
+
+  // Build column report for UI display
+  const colReport = Object.entries(cols).map(([field, idx]) => ({
+    field,
+    header: headerRow[idx],
+    col: String.fromCharCode(65 + idx), // A, B, C...
+    idx,
+  }));
+
+  // Parse data rows
+  const data = [];
+  for (let i = 1; i < allRows.length; i++) {
+    const r = allRows[i];
+    if (!r?.[cols.salesOrg] && !r?.[cols.article]) continue;
+
+    const plc = String(r[cols.plc] ?? "").trim();
+    if (plc === "15") continue;
+
+    const vf = cols.validFrom !== undefined ? r[cols.validFrom] : null;
+    const vt = cols.validTo   !== undefined ? r[cols.validTo]   : null;
+    if (!isActiveAt(vf, vt, refDate)) continue;
+
+    const salesOrg   = String(r[cols.salesOrg]   ?? "").trim();
+    const article    = String(r[cols.article]     ?? "").trim();
+    const pricingRef = cols.pricingRef !== undefined ? String(r[cols.pricingRef] ?? "").trim() : "";
+    const category   = cols.category   !== undefined ? String(r[cols.category]   ?? "").trim() : "";
+    const price      = parseFloat(String(r[cols.price] ?? "").replace(",", "."));
+    const currency   = cols.currency   !== undefined ? String(r[cols.currency]   ?? "").trim() : "";
+
+    if (!salesOrg || !article) continue;
+    const isGeneric = !pricingRef;
+
+    // PLC 25 non-CW: only keep generic rows (SKU rows ignored)
+    if (plc === "25" && category !== CHILDRENWEAR && !isGeneric) continue;
+
+    data.push({
+      salesOrg, article,
+      pricingRef: pricingRef || null,
+      plc, category,
+      price: isNaN(price) ? null : price,
+      currency, isGeneric,
+    });
+  }
+
+  return { data, colReport, warnings: missing };
+}
+
+// ─── SFCC Parser ──────────────────────────────────────────────────────────────
+// Stores ALL price entries per product with their optional dates.
+// Resolution to a single price happens at analysis time with the check date.
+// rawPrices: { pid: [{price, from, to}] }
+//   - from/to = null → continuous price (always active, used as fallback)
+//   - from/to = Date → dated price (active only within that window)
+function parseSFCC(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+  const pbId = doc.querySelector("header")?.getAttribute("pricebook-id") ?? "";
+  const m = pbId.match(/chl_([a-z]{2})_/i);
+  const salesOrg = m ? m[1].toUpperCase()+"CH" : null;
+  const rawPrices = {};
+
+  doc.querySelectorAll("price-table").forEach(t => {
+    const pid = (t.getAttribute("product-id")||"").trim();
+    const amt = t.querySelector("amount");
+    if (!pid || !amt) return;
+    const price = parseFloat(amt.textContent.trim().replace(",","."));
+    if (isNaN(price)) return;
+
+    const fromEl = t.querySelector("online-from");
+    const toEl   = t.querySelector("online-to");
+    const from   = fromEl ? new Date(fromEl.textContent.trim()) : null;
+    const to     = toEl   ? new Date(toEl.textContent.trim())   : null;
+
+    if (!rawPrices[pid]) rawPrices[pid] = [];
+    rawPrices[pid].push({ price, from, to });
+  });
+
+  return { pricebookId:pbId, salesOrg, rawPrices };
+}
+
+// ─── SFCC Price Resolver ──────────────────────────────────────────────────────
+// At a given checkDate, resolve each product's effective price:
+//   1. Collect all dated entries active at checkDate
+//   2. If multiple active dated entries → DQ issue (overlapping)
+//   3. If exactly one active dated entry → use it (priority over continuous)
+//   4. If no active dated entry → use continuous price (no dates)
+//   5. If neither → absent
+// Returns { prices: {pid: price}, dqIssues: [{pid, entries}] }
+function resolveSFCCPrices(rawPrices, checkDate) {
+  const prices = {};
+  const dqIssues = [];
+  const d0 = new Date(checkDate); d0.setHours(12,0,0,0);
+
+  for (const [pid, entries] of Object.entries(rawPrices)) {
+    const dated      = entries.filter(e => e.from !== null && e.to !== null);
+    const continuous = entries.filter(e => e.from === null && e.to === null);
+
+    // Find active dated entries at checkDate
+    const activeDated = dated.filter(e => e.from <= d0 && d0 <= e.to);
+
+    if (activeDated.length > 1) {
+      // DQ issue: multiple dated prices active at same time
+      dqIssues.push({ pid, entries: activeDated });
+      // Use first one anyway, flag it
+      prices[pid] = activeDated[0].price;
+    } else if (activeDated.length === 1) {
+      // One active dated price — use it (priority)
+      prices[pid] = activeDated[0].price;
+    } else if (continuous.length > 0) {
+      // No active dated price — fall back to continuous
+      prices[pid] = continuous[0].price;
+    }
+    // else: no price at this date → pid not added → KO_MISSING
+  }
+
+  return { prices, dqIssues };
+}
+
+// ─── Check Engine ─────────────────────────────────────────────────────────────
+function runChecks(sapData, sfccByOrg) {
+  return sapData.map(row => {
+    const sfcc = sfccByOrg[row.salesOrg] ?? {};
+    const isCW = row.category === CHILDRENWEAR;
+    let status = "KO_MISSING", sfccPrice = null, checkLevel = "", detail = "";
+
+    sfccPrice  = sfcc[row.article] ?? null;
+    checkLevel = (row.plc === "25" && !isCW) ? "Generic" : "SKU";
+
+    if (sfccPrice === null) {
+      status = "KO_MISSING";
+      detail = checkLevel === "Generic" ? "Generic absent SFCC" : "Absent SFCC";
+    } else if (row.price !== null && Math.abs(sfccPrice - row.price) < EPS) {
+      status = "PASS";
+    } else {
+      status = "KO_DIFF";
+      detail = row.price !== null ? `Prix différent — Δ ${(sfccPrice - row.price).toFixed(2)}` : "Prix SAP vide";
+    }
+
+    return { ...row, sfccPrice, status, checkLevel, detail };
+  });
+}
+
+// ─── Export ───────────────────────────────────────────────────────────────────
+function toExportRows(rows, checkDateLabel) {
+  return rows.map(r => ({
+    "Date de check":         checkDateLabel,
+    "Sales Org":             r.salesOrg,
+    "Article":               r.article,
+    "Pricing Ref (Generic)": r.pricingRef ?? "",
+    "PLC":                   r.plc,
+    "Catégorie":             r.category,
+    "SAP Prix":              r.price ?? "",
+    "Devise":                r.currency,
+    "SFCC Prix":             r.sfccPrice ?? "",
+    "Niveau check":          r.checkLevel,
+    "Status":                r.status,
+    "Détail":                r.detail,
+  }));
+}
+function doXLSX(rows, label, checkDateLabel) {
+  const data = toExportRows(rows, checkDateLabel);
+  const ws = XLSX.utils.json_to_sheet(data);
+  ws["!cols"] = Object.keys(data[0]).map(() => ({ wch:22 }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Price Check");
+  XLSX.writeFile(wb, `chloe_v2_${label}_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+function doCSV(rows, label, checkDateLabel) {
+  const data = toExportRows(rows, checkDateLabel);
+  const hs = Object.keys(data[0]);
+  const esc = v => `"${String(v).replace(/"/g,'""')}"`;
+  const lines = [hs.map(esc).join(","), ...data.map(r => hs.map(h=>esc(r[h])).join(","))];
+  const url = URL.createObjectURL(new Blob([lines.join("\n")], { type:"text/csv;charset=utf-8;" }));
+  Object.assign(document.createElement("a"), { href:url, download:`chloe_v2_${label}_${new Date().toISOString().slice(0,10)}.csv` }).click();
+  URL.revokeObjectURL(url);
+}
+
+// ─── UI Components ────────────────────────────────────────────────────────────
+function KpiCard({ label, value, sub, color, onClick, active }) {
+  return (
+    <div onClick={onClick} style={{ background:active?"#0f1a0f":"#0f0f0f", border:active?"1px solid #C9A97A55":"1px solid #1a1a1a", padding:"14px 16px", cursor:onClick?"pointer":"default", transition:"all .2s" }}>
+      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#444", letterSpacing:".18em", textTransform:"uppercase", marginBottom:"8px" }}>{label}</div>
+      <div style={{ fontSize:"26px", fontWeight:300, color, lineHeight:1 }}>{value}</div>
+      {sub && <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#333", marginTop:"5px" }}>{sub}</div>}
+    </div>
+  );
+}
+
+function ExportMenu({ rows, label, checkDateLabel, small }) {
+  const [open, setOpen] = useState(false);
+  const s = small
+    ? { background:"transparent", border:"1px solid #C9A97A55", color:"#C9A97A", padding:"5px 10px", fontFamily:"'Montserrat',sans-serif", fontSize:"8px", letterSpacing:".12em", cursor:"pointer", textTransform:"uppercase", display:"flex", alignItems:"center", gap:"4px" }
+    : { background:"transparent", border:"1px solid #C9A97A", color:"#C9A97A", padding:"7px 14px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".15em", cursor:"pointer", textTransform:"uppercase", display:"flex", alignItems:"center", gap:"6px" };
+  return (
+    <div style={{ position:"relative", display:"inline-block" }}>
+      <button style={s} onClick={()=>setOpen(o=>!o)}>
+        ↓ Export{!small && ` (${rows.length})`} <span style={{ opacity:.5 }}>{open?"▲":"▼"}</span>
+      </button>
+      {open && (
+        <div style={{ position:"absolute", right:0, top:"100%", marginTop:"2px", background:"#111", border:"1px solid #2a2a2a", zIndex:99, minWidth:"130px" }}>
+          {[
+            { ext:"XLSX", icon:"📊", fn:()=>{ doXLSX(rows,label,checkDateLabel); setOpen(false); } },
+            { ext:"CSV",  icon:"📄", fn:()=>{ doCSV(rows,label,checkDateLabel);  setOpen(false); } },
+          ].map(({ ext, icon, fn }) => (
+            <button key={ext} onClick={fn}
+              style={{ display:"block", width:"100%", background:"transparent", border:"none", borderBottom:"1px solid #1a1a1a", color:"#ccc", padding:"9px 14px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", letterSpacing:".1em", textTransform:"uppercase", cursor:"pointer", textAlign:"left" }}
+              onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
+              onMouseLeave={e=>e.currentTarget.style.background="transparent"}
+            >{icon} {ext}</button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatusTag({ status }) {
+  const cfg = {
+    PASS:       { bg:"#0a1e0f", color:"#4CAF7A", label:"✓ PASS" },
+    KO_DIFF:    { bg:"#1e0a0a", color:"#E05252", label:"✗ KO — prix différent" },
+    KO_MISSING: { bg:"#1a0a14", color:"#E052A0", label:"✗ KO — absent SFCC" },
+  };
+  const c = cfg[status] ?? { bg:"#111", color:"#444", label:status };
+  return <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".06em", padding:"2px 7px", textTransform:"uppercase", borderRadius:"1px", display:"inline-block", background:c.bg, color:c.color, whiteSpace:"nowrap" }}>{c.label}</span>;
+}
+
+// Column report panel shown after SAP file is loaded
+function ColReport({ colReport, warnings }) {
+  const [open, setOpen] = useState(false);
+  const hasWarnings = warnings && warnings.length > 0;
+  return (
+    <div style={{ marginTop:"8px", maxWidth:"600px" }}>
+      <button onClick={()=>setOpen(o=>!o)}
+        style={{ background:"transparent", border:`1px solid ${hasWarnings?"#C9A97A44":"#1e2e1e"}`, color:hasWarnings?"#C9A97A":"#4CAF7A", padding:"5px 12px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".1em", cursor:"pointer", textTransform:"uppercase", display:"flex", alignItems:"center", gap:"6px" }}>
+        {hasWarnings ? "⚠" : "✓"} Colonnes détectées {open?"▲":"▼"}
+      </button>
+      {open && (
+        <div style={{ background:"#0d0d0d", border:"1px solid #1a1a1a", padding:"10px 14px", marginTop:"4px" }}>
+          <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#444", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"8px" }}>Mapping colonnes résolu</div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:"6px 16px" }}>
+            {colReport.map(c => (
+              <div key={c.field} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#666", display:"flex", gap:"6px" }}>
+                <span style={{ color:"#C9A97A", minWidth:"90px" }}>{c.field}</span>
+                <span style={{ color:"#4CAF7A" }}>Col {c.col}</span>
+                <span style={{ color:"#333", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>"{c.header}"</span>
+              </div>
+            ))}
+          </div>
+          {hasWarnings && (
+            <div style={{ marginTop:"10px", borderTop:"1px solid #1a1a1a", paddingTop:"8px" }}>
+              <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#C9A97A", letterSpacing:".15em", textTransform:"uppercase", marginBottom:"6px" }}>⚠ Colonnes optionnelles non trouvées</div>
+              {warnings.map(w => (
+                <div key={w.field} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555", lineHeight:"1.7" }}>
+                  <span style={{ color:"#C9A97A88" }}>{w.field}</span> → essayé : {w.tried.join(", ")}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const css = `
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300&family=Montserrat:wght@300;400;500&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0;}
+  ::-webkit-scrollbar{width:3px;height:3px;}::-webkit-scrollbar-track{background:#0a0a0a;}::-webkit-scrollbar-thumb{background:#C9A97A;}
+  .uc{border:1px solid #1e1e1e;background:#0f0f0f;padding:18px;transition:all .3s;position:relative;cursor:pointer;}
+  .uc:hover{border-color:#C9A97A44;}.uc.ok{border-color:#2a4a2a;background:#0b150b;}
+  .uc input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;}
+  .fb{background:transparent;border:1px solid #1e1e1e;color:#555;padding:5px 12px;cursor:pointer;font-family:'Montserrat',sans-serif;font-size:9px;letter-spacing:.1em;transition:all .2s;text-transform:uppercase;white-space:nowrap;}
+  .fb.on{border-color:#C9A97A;color:#C9A97A;background:#C9A97A0d;}.fb:hover:not(.on){border-color:#C9A97A44;color:#C9A97A77;}
+  .ab{background:#C9A97A;color:#0a0a0a;border:none;padding:12px 40px;font-family:'Montserrat',sans-serif;font-size:11px;font-weight:500;letter-spacing:.2em;text-transform:uppercase;cursor:pointer;transition:all .3s;}
+  .ab:hover:not(:disabled){background:#DFC090;}.ab:disabled{background:#1e1e1e;color:#333;cursor:not-allowed;}
+  .tr{border-bottom:1px solid #111;transition:background .1s;}.tr:hover{background:#0f0f0f;}
+  .sr{background:#0f0f0f;border:1px solid #1e1e1e;color:#ccc;padding:6px 10px;font-family:'Montserrat',sans-serif;font-size:10px;outline:none;}
+  .sr:focus{border-color:#C9A97A44;}.sr::placeholder{color:#282828;}
+  .sel{background:#111;border:1px solid #1e1e1e;color:#999;padding:6px 10px;font-family:'Montserrat',sans-serif;font-size:10px;outline:none;}
+  .sel:focus{border-color:#C9A97A44;}
+  .chip{display:inline-flex;align-items:center;gap:6px;background:#111;border:1px solid #2a2a2a;padding:4px 8px;font-family:'Montserrat',sans-serif;font-size:9px;color:#888;}
+  .chip.ok{border-color:#2a4a2a;color:#4CAF7A;}.chip.warn{border-color:#4a3a0a;color:#C9A97A;}
+  .rm{background:none;border:none;color:#444;cursor:pointer;font-size:11px;padding:0 2px;}.rm:hover{color:#E05252;}
+  .ovr{background:#0a0a0a;border:1px solid #C9A97A44;color:#C9A97A;padding:3px 6px;font-family:'Montserrat',sans-serif;font-size:9px;width:80px;outline:none;}
+  .date-input{background:#0f0f0f;border:1px solid #C9A97A44;color:#F0EBE0;padding:8px 12px;font-family:'Montserrat',sans-serif;font-size:11px;outline:none;cursor:pointer;transition:border-color .2s;}
+  .date-input:focus{border-color:#C9A97A;}
+  .date-input::-webkit-calendar-picker-indicator{filter:invert(0.7) sepia(1) saturate(2) hue-rotate(5deg);cursor:pointer;}
+`;
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+export default function PriceCheckerV2() {
+  const [sapRaw,       setSapRaw]       = useState(null);
+  const [sapFileName,  setSapFileName]  = useState("");
+  const [sapMeta,      setSapMeta]      = useState(null); // { colReport, warnings }
+  const [xmlFiles,     setXmlFiles]     = useState([]);
+  const [results,      setResults]      = useState(null);
+  const [checkDateISO, setCheckDateISO] = useState(todayISO());
+  const [appliedDate,  setAppliedDate]  = useState(null);
+  const [sapCoverage,  setSapCoverage]  = useState(null);
+  const [dqIssues,     setDqIssues]     = useState([]);
+  const [loading,      setLoading]      = useState(false);
+  const [loadMsg,      setLoadMsg]      = useState("");
+  const [error,        setError]        = useState("");
+  const [filterOrg,    setFilterOrg]    = useState("all");
+  const [filterStatus, setFilterStatus] = useState("all");
+  const [search,       setSearch]       = useState("");
+  const [page,         setPage]         = useState(0);
+
+  // On SAP upload: just store the raw buffer + do a quick header scan
+  const handleSAP = useCallback(e => {
+    const file = e.target.files[0]; if (!file) return;
+    setSapFileName(file.name); setSapMeta(null); setError("");
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        // Quick header scan to validate columns immediately
+        const wb = XLSX.read(ev.target.result, { type:"array", sheetRows:1 });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const headerRow = XLSX.utils.sheet_to_json(ws, { header:1 })[0] ?? [];
+        const headers = headerRow.map(h => String(h ?? "").trim());
+        const { cols, missing } = resolveColumns(headers);
+        const critical = ["salesOrg","article","plc","validFrom","validTo","price"];
+        const criticalMissing = missing.filter(m => critical.includes(m.field));
+        if (criticalMissing.length > 0) {
+          const details = criticalMissing.map(m => `"${m.field}"`).join(", ");
+          setError(`Colonnes critiques introuvables : ${details}. En-têtes détectés : ${headers.filter(Boolean).join(", ")}`);
+          return;
+        }
+        const colReport = Object.entries(cols).map(([field, idx]) => ({
+          field, header: headers[idx],
+          col: idx < 26 ? String.fromCharCode(65+idx) : `Col${idx+1}`,
+          idx,
+        }));
+        setSapMeta({ colReport, warnings: missing });
+        setSapRaw(ev.target.result);
+      } catch(err) { setError("Erreur SAP : "+err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  const handleXML = useCallback(e => {
+    Array.from(e.target.files).forEach(file => {
+      const reader = new FileReader();
+      reader.onload = ev => {
+        try {
+          const parsed = parseSFCC(ev.target.result);
+          setXmlFiles(prev => prev.find(x=>x.pricebookId===parsed.pricebookId) ? prev : [...prev, { name:file.name, ...parsed, salesOrgOverride:"" }]);
+          setError("");
+        } catch(err) { setError("Erreur XML : "+err.message); }
+      };
+      reader.readAsText(file);
+    });
+    e.target.value = "";
+  }, []);
+
+  const removeXml   = id      => setXmlFiles(prev => prev.filter(x=>x.pricebookId!==id));
+  const setOverride = (id, v) => setXmlFiles(prev => prev.map(x=>x.pricebookId===id?{...x,salesOrgOverride:v.toUpperCase()}:x));
+
+  const handleAnalyze = () => {
+    if (!sapRaw)          { setError("Fichier SAP manquant."); return; }
+    if (!xmlFiles.length) { setError("Aucun pricebook SFCC chargé."); return; }
+    if (!checkDateISO)    { setError("Date de check manquante."); return; }
+    setLoading(true); setLoadMsg("Analyse en cours…");
+    const refDate = new Date(checkDateISO+"T00:00:00");
+    setTimeout(() => {
+      try {
+        const { data: sapData } = parseSAP(sapRaw, refDate);
+        // Capture all Sales Orgs present in SAP at the check date (before any filtering)
+        const allSapOrgs = [...new Set(sapData.map(r => r.salesOrg))].sort();
+        setSapCoverage(allSapOrgs);
+        // Resolve SFCC prices at check date (dated priority > continuous fallback)
+        const sfccByOrg = {};
+        const allDqIssues = [];
+        xmlFiles.forEach(x => {
+          const org = x.salesOrgOverride || x.salesOrg;
+          if (!org) return;
+          const { prices, dqIssues } = resolveSFCCPrices(x.rawPrices, refDate);
+          sfccByOrg[org] = prices;
+          dqIssues.forEach(issue => allDqIssues.push({ ...issue, salesOrg: org }));
+        });
+        setDqIssues(allDqIssues);
+        setResults(runChecks(sapData, sfccByOrg));
+        setAppliedDate(refDate);
+        setFilterOrg("all"); setFilterStatus("all"); setSearch(""); setPage(0); setDqIssues([]); setError("");
+      } catch(err) { setError("Erreur : "+err.message); }
+      setLoading(false);
+    }, 50);
+  };
+
+  const stats = useMemo(() => {
+    if (!results) return null;
+    const orgs = [...new Set(results.map(r=>r.salesOrg))].sort();
+    const byOrg = {};
+    orgs.forEach(org => {
+      const cr = results.filter(r=>r.salesOrg===org);
+      byOrg[org] = { total:cr.length, pass:cr.filter(r=>r.status==="PASS").length, koDiff:cr.filter(r=>r.status==="KO_DIFF").length, koMiss:cr.filter(r=>r.status==="KO_MISSING").length };
+      byOrg[org].ko = byOrg[org].koDiff + byOrg[org].koMiss;
+    });
+    const pass=results.filter(r=>r.status==="PASS").length, koDiff=results.filter(r=>r.status==="KO_DIFF").length, koMiss=results.filter(r=>r.status==="KO_MISSING").length;
+    return { total:results.length, pass, koDiff, koMiss, ko:koDiff+koMiss, orgs, byOrg };
+  }, [results]);
+
+  // Coverage: SAP orgs vs uploaded pricebooks
+  const coverage = useMemo(() => {
+    if (!sapCoverage || !xmlFiles.length) return null;
+    const uploadedOrgs = new Set(xmlFiles.map(x => x.salesOrgOverride || x.salesOrg).filter(Boolean));
+    const matched = sapCoverage.filter(o => uploadedOrgs.has(o));
+    const missing = sapCoverage.filter(o => !uploadedOrgs.has(o));
+    const extra   = [...uploadedOrgs].filter(o => !sapCoverage.includes(o));
+    return { matched, missing, extra };
+  }, [sapCoverage, xmlFiles]);
+
+  const filtered = useMemo(() => {
+    if (!results) return [];
+    return results.filter(r => {
+      const ps = filterStatus==="all"?true:filterStatus==="KO"?(r.status==="KO_DIFF"||r.status==="KO_MISSING"):r.status===filterStatus;
+      if (filterOrg!=="all" && r.salesOrg!==filterOrg) return false;
+      if (!ps) return false;
+      if (search) { const q=search.toLowerCase(); if (!r.article.toLowerCase().includes(q)&&!r.salesOrg.toLowerCase().includes(q)) return false; }
+      return true;
+    });
+  }, [results, filterOrg, filterStatus, search]);
+
+  const paged    = filtered.slice(0,(page+1)*PAGE_SIZE);
+  const hasMore  = filtered.length > paged.length;
+  const unmapped = xmlFiles.filter(x=>!x.salesOrg&&!x.salesOrgOverride);
+  const checkDateLabel = appliedDate ? fmtDate(appliedDate) : "";
+  const exportLabel = filterStatus!=="all"?filterStatus.toLowerCase():filterOrg!=="all"?filterOrg.toLowerCase():"complet";
+  const isToday = checkDateISO===todayISO();
+
+  return (
+    <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", background:"#0a0a0a", minHeight:"100vh", color:"#F0EBE0" }}>
+      <style>{css}</style>
+
+      <header style={{ borderBottom:"1px solid #141414", padding:"14px 28px", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+        <div>
+          <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".35em", color:"#C9A97A", textTransform:"uppercase", marginBottom:"3px" }}>Chloé · Digital Operations</div>
+          <h1 style={{ fontWeight:300, fontSize:"19px", letterSpacing:".06em", lineHeight:1 }}>
+            Price Check <span style={{ fontStyle:"italic", color:"#C9A97A" }}>SAP ↔ SFCC</span>
+            <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#444", marginLeft:"12px", letterSpacing:".08em" }}>Multi-pays · Règles PLC</span>
+          </h1>
+        </div>
+        <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
+          {appliedDate && (
+            <div style={{ background:"#141414", border:"1px solid #C9A97A33", padding:"6px 12px", display:"flex", alignItems:"center", gap:"8px" }}>
+              <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#555", letterSpacing:".15em", textTransform:"uppercase" }}>Check au</span>
+              <span style={{ fontFamily:"'Cormorant Garamond',serif", fontSize:"16px", color:"#C9A97A", fontWeight:300 }}>{checkDateLabel}</span>
+              {isToday && <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#4CAF7A", background:"#0a1e0f", padding:"1px 5px" }}>aujourd'hui</span>}
+            </div>
+          )}
+          {results && (
+            <>
+              <button onClick={()=>{ setResults(null); setAppliedDate(null); setSapCoverage(null); setDqIssues([]); }}
+                style={{ background:"transparent", border:"1px solid #1e1e1e", color:"#555", padding:"7px 14px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".15em", cursor:"pointer", textTransform:"uppercase" }}>
+                ← Reset
+              </button>
+              <ExportMenu rows={filtered} label={exportLabel} checkDateLabel={checkDateLabel} />
+            </>
+          )}
+        </div>
+      </header>
+
+      {loading && (
+        <div style={{ background:"#C9A97A11", borderBottom:"1px solid #C9A97A22", padding:"8px 28px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#C9A97A", letterSpacing:".15em", textTransform:"uppercase" }}>
+          ⏳ {loadMsg}
+        </div>
+      )}
+
+      <div style={{ padding:"22px 28px", maxWidth:"1600px" }}>
+
+        {!results && (
+          <div style={{ display:"flex", flexDirection:"column", gap:"18px" }}>
+
+            {/* Date */}
+            <div>
+              <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".25em", color:"#C9A97A", textTransform:"uppercase", marginBottom:"7px" }}>① Date de check</div>
+              <div style={{ display:"flex", alignItems:"center", gap:"12px", background:"#0f0f0f", border:"1px solid #C9A97A33", padding:"14px 18px", maxWidth:"420px" }}>
+                <div style={{ fontSize:"18px" }}>📅</div>
+                <div style={{ flex:1 }}>
+                  <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555", marginBottom:"6px", letterSpacing:".1em" }}>Vérifier l'alignement à cette date</div>
+                  <input type="date" className="date-input" value={checkDateISO} onChange={e=>setCheckDateISO(e.target.value)} />
+                </div>
+                <div style={{ textAlign:"right" }}>
+                  <div style={{ fontFamily:"'Cormorant Garamond',serif", fontSize:"20px", color:"#C9A97A", fontWeight:300, lineHeight:1 }}>
+                    {checkDateISO ? fmtDate(new Date(checkDateISO+"T00:00:00")) : "—"}
+                  </div>
+                  {isToday && <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#4CAF7A", marginTop:"3px" }}>aujourd'hui</div>}
+                </div>
+              </div>
+              <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#2a2a2a", marginTop:"5px" }}>
+                Seules les lignes SAP avec Valid From ≤ date ≤ Valid To seront incluses.
+              </div>
+            </div>
+
+            {/* SAP */}
+            <div>
+              <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".25em", color:"#C9A97A", textTransform:"uppercase", marginBottom:"7px" }}>② Fichier SAP (.xlsx)</div>
+              <div className={`uc ${sapRaw?"ok":""}`} style={{ maxWidth:"600px" }}>
+                <input type="file" accept=".xlsx,.xls" onChange={handleSAP} disabled={loading} />
+                <div style={{ display:"flex", alignItems:"center", gap:"12px" }}>
+                  <div style={{ fontSize:"20px", opacity:sapRaw?1:0.15 }}>📊</div>
+                  <div>
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"11px", color:sapRaw?"#4CAF7A":"#444" }}>
+                      {sapRaw ? sapFileName : "Déposer ou cliquer"}
+                    </div>
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:sapRaw?"#4CAF7A88":"#282828", marginTop:"3px" }}>
+                      {sapRaw ? "Colonnes détectées automatiquement par nom d'en-tête" : "Colonnes détectées automatiquement — résistant aux changements de position"}
+                    </div>
+                  </div>
+                </div>
+              </div>
+              {sapMeta && <ColReport colReport={sapMeta.colReport} warnings={sapMeta.warnings} />}
+            </div>
+
+            {/* XMLs */}
+            <div>
+              <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".25em", color:"#C9A97A", textTransform:"uppercase", marginBottom:"7px" }}>③ Pricebooks SFCC (.xml) — multi-fichiers</div>
+              <div className="uc" style={{ maxWidth:"600px", marginBottom:"10px" }}>
+                <input type="file" accept=".xml" multiple onChange={handleXML} disabled={loading} />
+                <div style={{ display:"flex", alignItems:"center", gap:"12px" }}>
+                  <div style={{ fontSize:"20px", opacity:0.15 }}>🗂️</div>
+                  <div>
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"11px", color:"#444" }}>Déposer ou cliquer — sélection multiple</div>
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#282828", marginTop:"3px" }}>Sales Org auto-détectée depuis le pricebook-id</div>
+                  </div>
+                </div>
+              </div>
+              {xmlFiles.length > 0 && (
+                <div style={{ display:"flex", flexWrap:"wrap", gap:"8px" }}>
+                  {xmlFiles.map(x => {
+                    const org=x.salesOrgOverride||x.salesOrg;
+                    return (
+                      <div key={x.pricebookId} className={`chip ${org?"ok":"warn"}`}>
+                        <span>🗂️</span>
+                        <span style={{ maxWidth:"140px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{x.name}</span>
+                        {org
+                          ? <span style={{ background:"#0a200a", border:"1px solid #2a4a2a", padding:"1px 5px", color:"#4CAF7A", fontWeight:500 }}>{org}</span>
+                          : <span style={{ display:"flex", alignItems:"center", gap:"3px" }}>
+                              <span style={{ color:"#C9A97A", fontSize:"8px" }}>Sales Org?</span>
+                              <input className="ovr" value={x.salesOrgOverride} onChange={e=>setOverride(x.pricebookId,e.target.value)} placeholder="ex: AECH" />
+                            </span>}
+                        <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#444" }}>{Object.keys(x.rawPrices).length.toLocaleString()} prix</span>
+                        <button className="rm" onClick={()=>removeXml(x.pricebookId)}>✕</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Règles */}
+            <div style={{ maxWidth:"600px", background:"#0d0d0d", border:"1px solid #141414", padding:"12px 16px" }}>
+              <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#444", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"8px" }}>Règles de check</div>
+              {[
+                { plc:"PLC 15",                    rule:"Ignoré — aucun check",                           color:"#333" },
+                { plc:"PLC 25 · non-Childrenwear", rule:"Check Generic uniquement (ligne SKU ignorée)",    color:"#C9A97A" },
+                { plc:"PLC 25 · Childrenwear",     rule:"Check SKU SAP = SKU SFCC · KO si absent",        color:"#5ab0f0" },
+                { plc:"PLC 57 et autres",          rule:"Check SKU SAP = SKU SFCC · KO si absent",        color:"#a07de0" },
+              ].map(r=>(
+                <div key={r.plc} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555", lineHeight:"1.9", display:"flex", gap:"8px" }}>
+                  <span style={{ color:r.color, minWidth:"210px", flexShrink:0 }}>{r.plc}</span>
+                  <span>{r.rule}</span>
+                </div>
+              ))}
+            </div>
+
+            {error && <div style={{ maxWidth:"600px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#E05252", padding:"10px 14px", border:"1px solid #E0525222", background:"#E052520a", whiteSpace:"pre-line" }}>{error}</div>}
+            {unmapped.length>0 && <div style={{ maxWidth:"600px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#C9A97A", padding:"8px 12px", border:"1px solid #C9A97A22", background:"#C9A97A08" }}>⚠ {unmapped.length} pricebook(s) sans Sales Org détectée</div>}
+
+            <div><button className="ab" onClick={handleAnalyze} disabled={!sapRaw||!xmlFiles.length||!checkDateISO||loading}>{loading?"Analyse…":"Lancer l'analyse"}</button></div>
+          </div>
+        )}
+
+        {/* RESULTS */}
+        {results && stats && (
+          <>
+            {/* Coverage summary */}
+            {coverage && (
+              <div style={{ marginBottom:"16px", background:"#0d0d0d", border:"1px solid #1a1a1a", padding:"14px 18px" }}>
+                <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#444", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"12px" }}>
+                  Résumé de la couverture — fichiers uploadés
+                </div>
+                <div style={{ display:"flex", gap:"24px", flexWrap:"wrap" }}>
+
+                  <div style={{ flex:1, minWidth:"180px" }}>
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#4CAF7A", letterSpacing:".15em", textTransform:"uppercase", marginBottom:"6px" }}>
+                      ✓ Pricebook chargé — inclus dans les KPIs ({coverage.matched.length})
+                    </div>
+                    <div style={{ display:"flex", flexWrap:"wrap", gap:"5px" }}>
+                      {coverage.matched.map(org => (
+                        <span key={org} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#0a1e0f", border:"1px solid #2a4a2a", color:"#4CAF7A", padding:"2px 8px" }}>{org}</span>
+                      ))}
+                      {coverage.matched.length === 0 && <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#333" }}>—</span>}
+                    </div>
+                  </div>
+
+                  {coverage.missing.length > 0 && (
+                    <div style={{ flex:1, minWidth:"180px" }}>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#E052A0", letterSpacing:".15em", textTransform:"uppercase", marginBottom:"6px" }}>
+                        ✗ Pricebook manquant — non inclus dans les KPIs ({coverage.missing.length})
+                      </div>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:"5px", marginBottom:"6px" }}>
+                        {coverage.missing.map(org => (
+                          <span key={org} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#1a0a14", border:"1px solid #4a1a3a", color:"#E052A0", padding:"2px 8px" }}>{org}</span>
+                        ))}
+                      </div>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#444", lineHeight:"1.6" }}>
+                        Ces Sales Orgs existent dans SAP mais aucun pricebook SFCC correspondant n'a été uploadé. Leurs lignes sont exclues des résultats et des KPIs.
+                      </div>
+                    </div>
+                  )}
+
+                  {coverage.extra.length > 0 && (
+                    <div style={{ flex:1, minWidth:"180px" }}>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#C9A97A", letterSpacing:".15em", textTransform:"uppercase", marginBottom:"6px" }}>
+                        ⚠ Pricebook sans données SAP ({coverage.extra.length})
+                      </div>
+                      <div style={{ display:"flex", flexWrap:"wrap", gap:"5px", marginBottom:"6px" }}>
+                        {coverage.extra.map(org => (
+                          <span key={org} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#1a1500", border:"1px solid #4a3a0a", color:"#C9A97A", padding:"2px 8px" }}>{org}</span>
+                        ))}
+                      </div>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#444", lineHeight:"1.6" }}>
+                        Pricebooks uploadés pour lesquels aucune ligne SAP n'existe à la date de check.
+                      </div>
+                    </div>
+                  )}
+
+                </div>
+              </div>
+            )}
+
+            <div style={{ display:"grid", gridTemplateColumns:`repeat(${dqIssues.length>0?5:4},1fr)`, gap:"8px", marginBottom:"8px" }}>
+              <KpiCard label="Total vérifiés"      value={stats.total.toLocaleString()}  color="#F0EBE0" sub={`Actifs au ${checkDateLabel}`} />
+              <KpiCard label="PASS"                value={stats.pass.toLocaleString()}   color="#4CAF7A" sub={`${((stats.pass/stats.total)*100).toFixed(1)}% alignés`} onClick={()=>{setFilterStatus("PASS");setPage(0);}} active={filterStatus==="PASS"} />
+              <KpiCard label="KO — prix différent" value={stats.koDiff.toLocaleString()} color="#E05252" sub="présent mais mauvais prix"    onClick={()=>{setFilterStatus("KO_DIFF");setPage(0);}} active={filterStatus==="KO_DIFF"} />
+              <KpiCard label="KO — absent SFCC"    value={stats.koMiss.toLocaleString()} color="#E052A0" sub="manquant dans pricebook"       onClick={()=>{setFilterStatus("KO_MISSING");setPage(0);}} active={filterStatus==="KO_MISSING"} />
+              {dqIssues.length > 0 && (
+                <KpiCard label="⚠ DQ — prix chevauchants SFCC" value={dqIssues.length.toLocaleString()} color="#F0A030" sub="plusieurs prix datés actifs" />
+              )}
+            </div>
+
+            <div style={{ display:"flex", height:"2px", marginBottom:"16px", gap:"1px" }}>
+              <div style={{ flex:stats.pass,   background:"#4CAF7A" }} />
+              <div style={{ flex:stats.koDiff, background:"#E05252" }} />
+              <div style={{ flex:stats.koMiss, background:"#E052A0" }} />
+            </div>
+
+            {/* DQ Issues panel */}
+            {dqIssues.length > 0 && (
+              <div style={{ background:"#1e1500", border:"1px solid #F0A03033", padding:"12px 16px", marginBottom:"14px" }}>
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:"10px" }}>
+                  <div>
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#F0A030", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"4px" }}>
+                      ⚠ Data Quality — Prix SFCC chevauchants
+                    </div>
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#ccc" }}>
+                      <strong style={{ color:"#F0A030", fontFamily:"'Cormorant Garamond',serif", fontSize:"16px", fontWeight:300 }}>{dqIssues.length}</strong> produit(s) ont plusieurs prix datés actifs simultanément dans SFCC à la date de check. Le premier prix trouvé a été utilisé.
+                    </div>
+                  </div>
+                  <ExportMenu
+                    rows={dqIssues.map(d => ({
+                      salesOrg: d.salesOrg, article: d.pid,
+                      entries: d.entries.map(e => `${e.price} (${e.from?.toISOString().slice(0,10)} → ${e.to?.toISOString().slice(0,10)})`).join(" | ")
+                    }))}
+                    label="dq_chevauchements"
+                    checkDateLabel={checkDateLabel}
+                    small
+                  />
+                </div>
+                <div style={{ marginTop:"10px", display:"flex", flexWrap:"wrap", gap:"5px" }}>
+                  {dqIssues.slice(0,20).map(d => (
+                    <span key={d.pid+d.salesOrg} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#111", border:"1px solid #F0A03033", color:"#F0A030", padding:"2px 8px" }}>
+                      {d.salesOrg} · {d.pid}
+                    </span>
+                  ))}
+                  {dqIssues.length > 20 && <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555" }}>+{dqIssues.length-20} autres</span>}
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginBottom:"14px", overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
+                <thead>
+                  <tr style={{ background:"#0c0c0c", borderBottom:"1px solid #1a1a1a" }}>
+                    {["Sales Org","Vérifiés","PASS","KO total","dont prix diff.","dont absents SFCC"].map(h=>(
+                      <th key={h} style={{ padding:"7px 12px", fontFamily:"'Montserrat',sans-serif", fontSize:"8px", letterSpacing:".12em", color:"#C9A97A", textTransform:"uppercase", fontWeight:500, textAlign:"left" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {stats.orgs.map(org=>{
+                    const o=stats.byOrg[org];
+                    return (
+                      <tr key={org} className="tr" style={{ cursor:"pointer" }} onClick={()=>{setFilterOrg(org);setPage(0);}}>
+                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:"#C9A97A" }}>{org}</td>
+                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:"#888" }}>{o.total.toLocaleString()}</td>
+                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:"#4CAF7A" }}>{o.pass.toLocaleString()}</td>
+                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:o.ko>0?"#E05252":"#333", fontWeight:o.ko>0?500:300 }}>{o.ko.toLocaleString()}</td>
+                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:o.koDiff>0?"#E05252":"#333" }}>{o.koDiff.toLocaleString()}</td>
+                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:o.koMiss>0?"#E052A0":"#333" }}>{o.koMiss.toLocaleString()}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ display:"flex", gap:"6px", marginBottom:"10px", flexWrap:"wrap", alignItems:"center" }}>
+              <select className="sel" value={filterOrg} onChange={e=>{setFilterOrg(e.target.value);setPage(0);}}>
+                <option value="all">Toutes Sales Org</option>
+                {stats.orgs.map(o=><option key={o} value={o}>{o}</option>)}
+              </select>
+              <div style={{ display:"flex", gap:"5px", flexWrap:"wrap" }}>
+                {[
+                  { key:"all",        label:`Tout — ${filtered.length}` },
+                  { key:"PASS",       label:`PASS — ${stats.pass}` },
+                  { key:"KO",         label:`KO total — ${stats.ko}` },
+                  { key:"KO_DIFF",    label:`Prix diff. — ${stats.koDiff}` },
+                  { key:"KO_MISSING", label:`Absents — ${stats.koMiss}` },
+                ].map(f=>(
+                  <button key={f.key} className={`fb ${filterStatus===f.key?"on":""}`} onClick={()=>{setFilterStatus(f.key);setPage(0);}}>{f.label}</button>
+                ))}
+              </div>
+              <input className="sr" style={{ width:"200px" }} placeholder="Rechercher Article…" value={search} onChange={e=>{setSearch(e.target.value);setPage(0);}} />
+              <span style={{ marginLeft:"auto", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#333" }}>{filtered.length.toLocaleString()} ligne(s)</span>
+              <ExportMenu rows={filtered} label={exportLabel} checkDateLabel={checkDateLabel} />
+            </div>
+
+            <div style={{ border:"1px solid #141414", overflowX:"auto", maxHeight:"500px", overflowY:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"12px" }}>
+                <thead style={{ position:"sticky", top:0, zIndex:1 }}>
+                  <tr style={{ background:"#0c0c0c", borderBottom:"1px solid #222" }}>
+                    {["Sales Org","Article","PricingRef","PLC","Catégorie","SAP Prix","Devise","SFCC Prix","Niveau","Status","Détail"].map(h=>(
+                      <th key={h} style={{ padding:"8px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"8px", letterSpacing:".12em", color:"#C9A97A", textTransform:"uppercase", fontWeight:500, textAlign:"left", whiteSpace:"nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {paged.map((row,i)=>(
+                    <tr key={i} className="tr">
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#C9A97A88", whiteSpace:"nowrap" }}>{row.salesOrg}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"11px", color:"#ddd", whiteSpace:"nowrap" }}>{row.article}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#555", whiteSpace:"nowrap" }}>{row.pricingRef??"—"}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:row.plc==="25"?"#C9A97A":"#a07de0" }}>{row.plc}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#555", whiteSpace:"nowrap" }}>{row.category}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"11px", color:"#999" }}>{fmt(row.price)}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#444" }}>{row.currency}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"11px", color:row.sfccPrice!==null?"#F0EBE0":"#333" }}>{fmt(row.sfccPrice)}</td>
+                      <td style={{ padding:"7px 11px" }}>
+                        <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", letterSpacing:".05em", color:row.checkLevel==="Generic"?"#a07de0":"#5ab0f0" }}>{row.checkLevel}</span>
+                      </td>
+                      <td style={{ padding:"7px 11px" }}><StatusTag status={row.status} /></td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555", whiteSpace:"nowrap" }}>{row.detail||"—"}</td>
+                    </tr>
+                  ))}
+                  {paged.length===0 && (
+                    <tr><td colSpan={11} style={{ padding:"40px", textAlign:"center", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#1a1a1a", letterSpacing:".2em", textTransform:"uppercase" }}>Aucun résultat</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {hasMore && (
+              <div style={{ display:"flex", justifyContent:"center", marginTop:"12px" }}>
+                <button className="fb" onClick={()=>setPage(p=>p+1)}>
+                  Charger {Math.min(PAGE_SIZE,filtered.length-paged.length).toLocaleString()} lignes de plus ({(filtered.length-paged.length).toLocaleString()} restantes)
+                </button>
+              </div>
+            )}
+
+            <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#222", marginTop:"8px", display:"flex", justifyContent:"space-between", flexWrap:"wrap", gap:"6px" }}>
+              <span>Check au {checkDateLabel} · Clic sur KPI ou Sales Org pour filtrer</span>
+              <span><span style={{ color:"#a07de0" }}>■</span> Generic · <span style={{ color:"#5ab0f0" }}>■</span> SKU</span>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
