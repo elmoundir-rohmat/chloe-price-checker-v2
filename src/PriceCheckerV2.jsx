@@ -186,6 +186,56 @@ function parseSFCC(xmlText) {
   return { pricebookId:pbId, salesOrg, rawPrices };
 }
 
+// ─── Multi-Pricebook Parser ───────────────────────────────────────────────────
+// Parses a combined XML file containing multiple <pricebook> elements inside a
+// root <pricebooks> element (Demandware/SFCC export format).
+// Returns an array of pricebook objects, one per <pricebook> found.
+function parseMultiPricebook(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+
+  // Support both namespaced and non-namespaced documents
+  const NS = "http://www.demandware.com/xml/impex/pricebook/2006-10-31";
+  const getEls = (parent, tag) => {
+    const direct = parent.querySelectorAll(tag);
+    if (direct.length) return Array.from(direct);
+    return Array.from(parent.getElementsByTagNameNS(NS, tag));
+  };
+
+  const pricebookEls = getEls(doc, "pricebook");
+  if (!pricebookEls.length) throw new Error("Aucun élément <pricebook> trouvé dans le fichier XML.");
+
+  return pricebookEls.map(pb => {
+    const headerEl = getEls(pb, "header")[0];
+    const pbId = headerEl?.getAttribute("pricebook-id") ?? "";
+    const m = pbId.match(/chl_([a-z]{2})_/i);
+    const salesOrg = m ? m[1].toUpperCase() + "CH" : null;
+
+    const rawPrices = {};
+    getEls(pb, "price-table").forEach(t => {
+      const pid = (t.getAttribute("product-id") || "").trim();
+      const amt = t.querySelector("amount") || getEls(t, "amount")[0];
+      if (!pid || !amt) return;
+      const price = parseFloat(amt.textContent.trim().replace(",", "."));
+      if (isNaN(price)) return;
+
+      const fromEl = t.querySelector("online-from") || getEls(t, "online-from")[0];
+      const toEl   = t.querySelector("online-to")   || getEls(t, "online-to")[0];
+      const from   = fromEl ? new Date(fromEl.textContent.trim()) : null;
+      const to     = toEl   ? new Date(toEl.textContent.trim())   : null;
+
+      if (!rawPrices[pid]) rawPrices[pid] = [];
+      rawPrices[pid].push({ price, from, to });
+    });
+
+    return {
+      pricebookId: pbId,
+      salesOrg,
+      rawPrices,
+      entryCount: Object.keys(rawPrices).length,
+    };
+  });
+}
+
 // ─── SFCC Price Resolver ──────────────────────────────────────────────────────
 // At a given checkDate, resolve each product's effective price:
 //   1. Collect all dated entries active at checkDate
@@ -459,6 +509,11 @@ export default function PriceCheckerV2() {
   const [sapCoverage,  setSapCoverage]  = useState(null);
   const [dqIssues,     setDqIssues]     = useState([]);
   const [sapDqIssues,  setSapDqIssues]  = useState([]);
+  const [mode,            setMode]           = useState("standard"); // "standard" | "combined"
+  const [splitResult,     setSplitResult]    = useState([]);         // parsed pricebooks from combined XML
+  const [selectedPbs,     setSelectedPbs]    = useState(new Set());  // checked pricebook IDs
+  const [orgOverrides,    setOrgOverrides]   = useState({});         // { pbId: "XXCH" }
+  const [combinedXmlName, setCombinedXmlName]= useState("");
   const [loading,      setLoading]      = useState(false);
   const [loadMsg,      setLoadMsg]      = useState("");
   const [error,        setError]        = useState("");
@@ -516,6 +571,24 @@ export default function PriceCheckerV2() {
 
   const removeXml   = id      => setXmlFiles(prev => prev.filter(x=>x.pricebookId!==id));
   const setOverride = (id, v) => setXmlFiles(prev => prev.map(x=>x.pricebookId===id?{...x,salesOrgOverride:v.toUpperCase()}:x));
+
+  // Handler for combined XML upload (mode combiné)
+  const handleCombinedXml = useCallback(e => {
+    const file = e.target.files[0]; if (!file) return;
+    setCombinedXmlName(file.name); setError("");
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const pbs = parseMultiPricebook(ev.target.result);
+        if (!pbs.length) throw new Error("Aucun pricebook trouvé dans le fichier.");
+        setSplitResult(pbs);
+        setSelectedPbs(new Set(pbs.map(p => p.pricebookId)));
+        setOrgOverrides({});
+      } catch(err) { setError("Erreur XML : " + err.message); }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }, []);
 
   const handleAnalyze = () => {
     if (!sapRaw)          { setError("Fichier SAP manquant."); return; }
@@ -610,6 +683,94 @@ export default function PriceCheckerV2() {
     }, 50);
   };
 
+  // ── Analyse mode combiné ────────────────────────────────────────────────────
+  // Same SAP DQ + dedup logic; SFCC built from selectedPbs / splitResult.
+  const handleAnalyzeCombined = () => {
+    if (!sapRaw)           { setError("Fichier SAP manquant."); return; }
+    if (!splitResult.length) { setError("Aucun pricebook chargé."); return; }
+    if (!checkDateISO)     { setError("Date de check manquante."); return; }
+    const activePbs = splitResult.filter(pb => selectedPbs.has(pb.pricebookId));
+    if (!activePbs.length) { setError("Aucun pricebook sélectionné."); return; }
+
+    setLoading(true); setLoadMsg("Analyse en cours…");
+    const refDate = new Date(checkDateISO + "T00:00:00");
+    setTimeout(() => {
+      try {
+        const { data: sapData, dqRows: sapDqRows } = parseSAP(sapRaw, refDate);
+
+        const allSapOrgs = [...new Set(sapData.map(r => r.salesOrg))].sort();
+        setSapCoverage(allSapOrgs);
+
+        // SAP DQ — identical logic to standard mode
+        const dqGrouped = {};
+        sapDqRows.forEach(row => {
+          const key = `${row.salesOrg}__${row.article}`;
+          if (!dqGrouped[key]) dqGrouped[key] = [];
+          dqGrouped[key].push(row);
+        });
+        const newSapDqIssues = [];
+        for (const rows of Object.values(dqGrouped)) {
+          if (rows.length < 2) continue;
+          const conflicting = new Set();
+          for (let i = 0; i < rows.length; i++) {
+            for (let j = i + 1; j < rows.length; j++) {
+              const a = rows[i], b = rows[j];
+              const overlapStart = a.validFrom >= b.validFrom ? a.validFrom : b.validFrom;
+              const overlapEnd   = a.validTo   <= b.validTo   ? a.validTo   : b.validTo;
+              if (overlapStart <= overlapEnd && overlapEnd >= refDate) {
+                conflicting.add(i); conflicting.add(j);
+              }
+            }
+          }
+          if (conflicting.size > 0) {
+            newSapDqIssues.push({
+              salesOrg: rows[0].salesOrg, article: rows[0].article, plc: rows[0].plc,
+              rows: [...conflicting].map(idx => rows[idx]),
+            });
+          }
+        }
+        setSapDqIssues(newSapDqIssues);
+
+        // Dedup SAP data
+        const checkGrouped = {};
+        sapData.forEach(row => {
+          const key = `${row.salesOrg}__${row.article}`;
+          if (!checkGrouped[key]) checkGrouped[key] = [];
+          checkGrouped[key].push(row);
+        });
+        const dedupedSapData = [];
+        for (const rows of Object.values(checkGrouped)) {
+          if (rows.length > 1) {
+            const best = rows.reduce((a, b) =>
+              (a.validFrom && b.validFrom && a.validFrom >= b.validFrom) ? a : b
+            );
+            dedupedSapData.push(best);
+          } else {
+            dedupedSapData.push(rows[0]);
+          }
+        }
+
+        // SFCC — from selected pricebooks
+        const sfccByOrg = {};
+        const allDqIssues = [];
+        activePbs.forEach(pb => {
+          const org = orgOverrides[pb.pricebookId] || pb.salesOrg;
+          if (!org) return;
+          const { prices, dqIssues } = resolveSFCCPrices(pb.rawPrices, refDate);
+          sfccByOrg[org] = prices;
+          dqIssues.forEach(issue => allDqIssues.push({ ...issue, salesOrg: org }));
+        });
+        setDqIssues(allDqIssues);
+
+        setResults(runChecks(dedupedSapData, sfccByOrg));
+        setAppliedDate(refDate);
+        setFilterOrg("all"); setFilterStatus("all"); setSearch(""); setPage(0);
+        setError("");
+      } catch(err) { setError("Erreur : " + err.message); }
+      setLoading(false);
+    }, 50);
+  };
+
   const stats = useMemo(() => {
     if (!results) return null;
     const orgs = [...new Set(results.map(r=>r.salesOrg))].sort();
@@ -673,7 +834,7 @@ export default function PriceCheckerV2() {
           )}
           {results && (
             <>
-              <button onClick={()=>{ setResults(null); setAppliedDate(null); setSapCoverage(null); setDqIssues([]); setSapDqIssues([]); }}
+              <button onClick={()=>{ setResults(null); setAppliedDate(null); setSapCoverage(null); setDqIssues([]); setSapDqIssues([]); setSplitResult([]); setSelectedPbs(new Set()); setOrgOverrides({}); setCombinedXmlName(""); }}
                 style={{ background:"transparent", border:"1px solid #1e1e1e", color:"#555", padding:"7px 14px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".15em", cursor:"pointer", textTransform:"uppercase" }}>
                 ← Reset
               </button>
@@ -692,7 +853,24 @@ export default function PriceCheckerV2() {
       <div style={{ padding:"22px 28px", maxWidth:"1600px" }}>
 
         {!results && (
-          <div style={{ display:"flex", flexDirection:"column", gap:"18px" }}>
+          <>
+            {/* ── Mode tabs ─────────────────────────────────────────────── */}
+            <div style={{ display:"flex", gap:"0", marginBottom:"22px", borderBottom:"1px solid #1a1a1a" }}>
+              {[
+                { key:"standard", label:"Mode standard", sub:"Un XML par pays" },
+                { key:"combined", label:"Mode fichier combiné", sub:"Un seul XML multi-pricebooks" },
+              ].map(t => (
+                <button key={t.key} onClick={()=>{ setMode(t.key); setError(""); }}
+                  style={{ background:"transparent", border:"none", borderBottom:mode===t.key?"2px solid #C9A97A":"2px solid transparent", color:mode===t.key?"#C9A97A":"#444", padding:"10px 22px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".18em", textTransform:"uppercase", cursor:"pointer", transition:"all .2s" }}>
+                  {t.label}
+                  <div style={{ fontSize:"8px", color:mode===t.key?"#C9A97A66":"#2a2a2a", marginTop:"2px", letterSpacing:".1em" }}>{t.sub}</div>
+                </button>
+              ))}
+            </div>
+
+            {/* ── Mode standard ─────────────────────────────────────────── */}
+            {mode === "standard" && (
+              <div style={{ display:"flex", flexDirection:"column", gap:"18px" }}>
 
             {/* Date */}
             <div>
@@ -792,6 +970,140 @@ export default function PriceCheckerV2() {
 
             <div><button className="ab" onClick={handleAnalyze} disabled={!sapRaw||!xmlFiles.length||!checkDateISO||loading}>{loading?"Analyse…":"Lancer l'analyse"}</button></div>
           </div>
+            )} {/* end mode standard */}
+
+            {/* ── Mode combiné ──────────────────────────────────────────── */}
+            {mode === "combined" && (
+              <div style={{ display:"flex", flexDirection:"column", gap:"18px" }}>
+
+                {/* Date */}
+                <div>
+                  <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".25em", color:"#C9A97A", textTransform:"uppercase", marginBottom:"7px" }}>① Date de check</div>
+                  <div style={{ display:"flex", alignItems:"center", gap:"12px", background:"#0f0f0f", border:"1px solid #C9A97A33", padding:"14px 18px", maxWidth:"420px" }}>
+                    <div style={{ fontSize:"18px" }}>📅</div>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555", marginBottom:"6px", letterSpacing:".1em" }}>Vérifier l'alignement à cette date</div>
+                      <input type="date" className="date-input" value={checkDateISO} onChange={e=>setCheckDateISO(e.target.value)} />
+                    </div>
+                    <div style={{ textAlign:"right" }}>
+                      <div style={{ fontFamily:"'Cormorant Garamond',serif", fontSize:"20px", color:"#C9A97A", fontWeight:300, lineHeight:1 }}>
+                        {checkDateISO ? fmtDate(new Date(checkDateISO+"T00:00:00")) : "—"}
+                      </div>
+                      {isToday && <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#4CAF7A", marginTop:"3px" }}>aujourd'hui</div>}
+                    </div>
+                  </div>
+                </div>
+
+                {/* SAP */}
+                <div>
+                  <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".25em", color:"#C9A97A", textTransform:"uppercase", marginBottom:"7px" }}>② Fichier SAP (.xlsx)</div>
+                  <div className={`uc ${sapRaw?"ok":""}`} style={{ maxWidth:"600px" }}>
+                    <input type="file" accept=".xlsx,.xls" onChange={handleSAP} disabled={loading} />
+                    <div style={{ display:"flex", alignItems:"center", gap:"12px" }}>
+                      <div style={{ fontSize:"20px", opacity:sapRaw?1:0.15 }}>📊</div>
+                      <div>
+                        <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"11px", color:sapRaw?"#4CAF7A":"#444" }}>{sapRaw ? sapFileName : "Déposer ou cliquer"}</div>
+                        <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:sapRaw?"#4CAF7A88":"#282828", marginTop:"3px" }}>Colonnes détectées automatiquement</div>
+                      </div>
+                    </div>
+                  </div>
+                  {sapMeta && <ColReport colReport={sapMeta.colReport} warnings={sapMeta.warnings} />}
+                </div>
+
+                {/* XML combiné */}
+                <div>
+                  <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".25em", color:"#C9A97A", textTransform:"uppercase", marginBottom:"7px" }}>③ Fichier XML combiné — tous les pricebooks</div>
+                  <div className={`uc ${splitResult.length?"ok":""}`} style={{ maxWidth:"600px" }}>
+                    <input type="file" accept=".xml" onChange={handleCombinedXml} disabled={loading} />
+                    <div style={{ display:"flex", alignItems:"center", gap:"12px" }}>
+                      <div style={{ fontSize:"20px", opacity:splitResult.length?1:0.15 }}>🗜️</div>
+                      <div>
+                        <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"11px", color:splitResult.length?"#4CAF7A":"#444" }}>
+                          {splitResult.length ? combinedXmlName : "Déposer ou cliquer — fichier XML multi-pricebooks"}
+                        </div>
+                        <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:splitResult.length?"#4CAF7A88":"#282828", marginTop:"3px" }}>
+                          {splitResult.length ? `${splitResult.length} pricebooks détectés` : "Tous les pricebooks pays en un seul fichier"}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Étape 2 — Confirmation des pricebooks */}
+                {splitResult.length > 0 && (
+                  <div style={{ maxWidth:"700px", background:"#0d0d0d", border:"1px solid #C9A97A33", padding:"16px 18px" }}>
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#C9A97A", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"14px" }}>
+                      Pricebooks détectés — {combinedXmlName}
+                    </div>
+
+                    <div style={{ display:"flex", flexDirection:"column", gap:"6px", marginBottom:"14px" }}>
+                      {splitResult.map(pb => {
+                        const checked = selectedPbs.has(pb.pricebookId);
+                        const orgVal  = orgOverrides[pb.pricebookId] ?? pb.salesOrg ?? "";
+                        return (
+                          <div key={pb.pricebookId} style={{ display:"flex", alignItems:"center", gap:"12px", padding:"8px 10px", background:checked?"#0f0f0f":"#080808", border:`1px solid ${checked?"#2a2a2a":"#111"}`, transition:"all .15s" }}>
+                            {/* Checkbox */}
+                            <input type="checkbox" checked={checked} onChange={e => {
+                              setSelectedPbs(prev => {
+                                const s = new Set(prev);
+                                e.target.checked ? s.add(pb.pricebookId) : s.delete(pb.pricebookId);
+                                return s;
+                              });
+                            }} style={{ accentColor:"#C9A97A", width:"14px", height:"14px", cursor:"pointer" }} />
+
+                            {/* Pricebook ID */}
+                            <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:checked?"#888":"#333", minWidth:"200px" }}>{pb.pricebookId}</span>
+
+                            {/* Arrow */}
+                            <span style={{ color:"#2a2a2a", fontSize:"10px" }}>→</span>
+
+                            {/* Sales Org (editable) */}
+                            <div style={{ display:"flex", alignItems:"center", gap:"6px" }}>
+                              {pb.salesOrg
+                                ? <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", fontWeight:500, color:checked?"#C9A97A":"#444", background:checked?"#C9A97A11":"transparent", border:"1px solid #2a2a2a", padding:"2px 8px", minWidth:"52px", textAlign:"center" }}>{orgVal || "?"}</span>
+                                : <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#C9A97A" }}>Sales Org?</span>
+                              }
+                              <input
+                                className="ovr"
+                                value={orgOverrides[pb.pricebookId] ?? ""}
+                                onChange={e => setOrgOverrides(prev => ({ ...prev, [pb.pricebookId]: e.target.value.toUpperCase() }))}
+                                placeholder="corriger"
+                                style={{ width:"70px" }}
+                              />
+                            </div>
+
+                            {/* Entry count */}
+                            <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#444", marginLeft:"auto" }}>
+                              {pb.entryCount.toLocaleString()} entrées
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Summary */}
+                    <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555", marginBottom:"14px", borderTop:"1px solid #1a1a1a", paddingTop:"10px" }}>
+                      <span style={{ color:"#C9A97A" }}>{selectedPbs.size}</span> pricebook(s) sélectionné(s) —{" "}
+                      <span style={{ color:"#C9A97A" }}>
+                        {new Set(splitResult.filter(pb => selectedPbs.has(pb.pricebookId)).map(pb => orgOverrides[pb.pricebookId] || pb.salesOrg).filter(Boolean)).size}
+                      </span> Sales Org(s) couvertes
+                    </div>
+
+                    {error && <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#E05252", padding:"8px 12px", border:"1px solid #E0525222", background:"#E052520a", marginBottom:"10px", whiteSpace:"pre-line" }}>{error}</div>}
+
+                    <button className="ab" onClick={handleAnalyzeCombined}
+                      disabled={!sapRaw || !selectedPbs.size || !checkDateISO || loading}>
+                      {loading ? "Analyse…" : "Lancer l'analyse →"}
+                    </button>
+                  </div>
+                )}
+
+                {!splitResult.length && error && (
+                  <div style={{ maxWidth:"600px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#E05252", padding:"10px 14px", border:"1px solid #E0525222", background:"#E052520a", whiteSpace:"pre-line" }}>{error}</div>
+                )}
+              </div>
+            )} {/* end mode combined */}
+          </>
         )}
 
         {/* RESULTS */}
