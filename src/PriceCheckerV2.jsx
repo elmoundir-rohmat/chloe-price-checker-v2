@@ -498,7 +498,82 @@ const css = `
 `;
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
+const PWD_KEY = "chloe_pc_auth";
+const CORRECT_PWD = "ChloePriceCheck";
+
+function LoginGate({ onAuth }) {
+  const [val, setVal]   = useState("");
+  const [err, setErr]   = useState(false);
+  const [show, setShow] = useState(false);
+
+  const submit = () => {
+    if (val === CORRECT_PWD) {
+      sessionStorage.setItem(PWD_KEY, "1");
+      onAuth();
+    } else {
+      setErr(true);
+      setVal("");
+      setTimeout(() => setErr(false), 2000);
+    }
+  };
+
+  return (
+    <div style={{ fontFamily:"'Cormorant Garamond',Georgia,serif", background:"#0a0a0a", minHeight:"100vh", color:"#F0EBE0", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300&family=Montserrat:wght@300;400;500&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0;}
+      `}</style>
+
+      <div style={{ textAlign:"center", marginBottom:"40px" }}>
+        <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", letterSpacing:".35em", color:"#C9A97A", textTransform:"uppercase", marginBottom:"10px" }}>Chloé · Digital Operations</div>
+        <div style={{ fontFamily:"'Cormorant Garamond',serif", fontSize:"32px", fontWeight:300, letterSpacing:".06em", color:"#F0EBE0", lineHeight:1.2 }}>
+          Price Check <span style={{ fontStyle:"italic", color:"#C9A97A" }}>SAP ↔ SFCC</span>
+        </div>
+      </div>
+
+      <div style={{ background:"#0f0f0f", border:`1px solid ${err?"#E0525255":"#C9A97A33"}`, padding:"28px 32px", width:"320px", transition:"border-color .3s" }}>
+        <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#555", letterSpacing:".2em", textTransform:"uppercase", marginBottom:"16px" }}>Accès restreint</div>
+
+        <div style={{ position:"relative", marginBottom:"10px" }}>
+          <input
+            type={show ? "text" : "password"}
+            value={val}
+            onChange={e => { setVal(e.target.value); setErr(false); }}
+            onKeyDown={e => e.key === "Enter" && submit()}
+            placeholder="Mot de passe"
+            autoFocus
+            style={{ width:"100%", background:"#0a0a0a", border:`1px solid ${err?"#E05252":"#1e1e1e"}`, color:"#F0EBE0", padding:"10px 36px 10px 12px", fontFamily:"'Montserrat',sans-serif", fontSize:"11px", outline:"none", transition:"border-color .2s" }}
+          />
+          <button onClick={() => setShow(s => !s)}
+            style={{ position:"absolute", right:"8px", top:"50%", transform:"translateY(-50%)", background:"none", border:"none", color:"#444", cursor:"pointer", fontSize:"13px", padding:"2px" }}>
+            {show ? "🙈" : "👁"}
+          </button>
+        </div>
+
+        {err && (
+          <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#E05252", marginBottom:"10px", letterSpacing:".05em" }}>
+            Mot de passe incorrect
+          </div>
+        )}
+
+        <button onClick={submit}
+          style={{ width:"100%", background:"#C9A97A", color:"#0a0a0a", border:"none", padding:"11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", fontWeight:500, letterSpacing:".2em", textTransform:"uppercase", cursor:"pointer", marginTop:"4px" }}>
+          Accéder
+        </button>
+      </div>
+
+      <div style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", color:"#1e1e1e", marginTop:"24px", letterSpacing:".1em" }}>
+        Session active jusqu'à fermeture de l'onglet
+      </div>
+    </div>
+  );
+}
+
 export default function PriceCheckerV2() {
+  const [authed, setAuthed] = useState(() => sessionStorage.getItem(PWD_KEY) === "1");
+
+  if (!authed) return <LoginGate onAuth={() => setAuthed(true)} />;
+
   const [sapRaw,       setSapRaw]       = useState(null);
   const [sapFileName,  setSapFileName]  = useState("");
   const [sapMeta,      setSapMeta]      = useState(null); // { colReport, warnings }
