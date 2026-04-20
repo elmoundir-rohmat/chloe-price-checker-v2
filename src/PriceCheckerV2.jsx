@@ -569,11 +569,15 @@ function LoginGate({ onAuth }) {
   );
 }
 
-export default function PriceCheckerV2() {
+// Wrapper: handles auth only. PriceCheckerV2 mounts ONLY when authed,
+// so its hooks are always called in consistent order (no Rules-of-Hooks violation).
+export default function App() {
   const [authed, setAuthed] = useState(() => sessionStorage.getItem(PWD_KEY) === "1");
-
   if (!authed) return <LoginGate onAuth={() => setAuthed(true)} />;
+  return <PriceCheckerV2 />;
+}
 
+function PriceCheckerV2() {
   const [sapRaw,       setSapRaw]       = useState(null);
   const [sapFileName,  setSapFileName]  = useState("");
   const [sapMeta,      setSapMeta]      = useState(null); // { colReport, warnings }
