@@ -1262,7 +1262,7 @@ function PriceCheckerV2() {
                 const nSame = dqIssues.filter(d => d.type === "PRIX_IDENTIQUES").length;
                 return (
                   <KpiCard
-                    label="⚠ DQ SFCC — prix chevauchants"
+                    label="⚠ DQ SFCC — dates chevauchantes"
                     value={dqIssues.length.toLocaleString()}
                     color={nDiff > 0 ? "#E05252" : "#F0A030"}
                     sub={nDiff > 0 ? `dont ${nDiff} prix différents` : `${nSame} prix identiques`}
