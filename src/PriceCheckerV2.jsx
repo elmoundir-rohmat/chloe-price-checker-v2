@@ -278,6 +278,9 @@ function parseMultiPricebook(xmlText) {
       rawPrices[pid].push({ price, from, to });
     });
 
+    // Ignore Sales pricebooks — keep only List pricebooks
+    if (!pbId.endsWith("_list")) return [];
+
     // Ignore pricebooks whose country is not in the known mapping
     if (!salesOrg) return [];
 
@@ -696,6 +699,10 @@ function PriceCheckerV2() {
       reader.onload = ev => {
         try {
           const parsed = parseSFCC(ev.target.result);
+          if (!parsed.pricebookId.endsWith("_list")) {
+            setError(`"${file.name}" est un pricebook Sales — seuls les pricebooks List sont acceptés.`);
+            return;
+          }
           setXmlFiles(prev => prev.find(x=>x.pricebookId===parsed.pricebookId) ? prev : [...prev, { name:file.name, ...parsed, salesOrgOverride:"" }]);
           setError("");
         } catch(err) { setError("Erreur XML : "+err.message); }
