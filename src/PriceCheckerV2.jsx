@@ -256,7 +256,7 @@ function parseMultiPricebook(xmlText) {
   const pricebookEls = getEls(doc, "pricebook");
   if (!pricebookEls.length) throw new Error("Aucun élément <pricebook> trouvé dans le fichier XML.");
 
-  return pricebookEls.map(pb => {
+  return pricebookEls.flatMap(pb => {
     const headerEl = getEls(pb, "header")[0];
     const pbId = headerEl?.getAttribute("pricebook-id") ?? "";
     const salesOrg = salesOrgFromPricebookId(pbId);
@@ -278,15 +278,18 @@ function parseMultiPricebook(xmlText) {
       rawPrices[pid].push({ price, from, to });
     });
 
+    // Ignore pricebooks whose country is not in the known mapping
+    if (!salesOrg) return [];
+
     const currency = currencyFromPricebookId(pbId);
-    return {
+    return [{
       pricebookId: pbId,
       salesOrg,
       rawPrices,
       entryCount: Object.keys(rawPrices).length,
       currency,
       isTargetCcy: isTargetCurrency(pbId),
-    };
+    }];
   });
 }
 
