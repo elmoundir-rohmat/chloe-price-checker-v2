@@ -37,6 +37,27 @@ const COUNTRY_TO_CURRENCY = {
   th:"THB", tn:"EUR", ae:"AED", gb:"GBP", uz:"EUR", vn:"USD",
 };
 
+// Country display names (for KPI table + filters)
+const ISO_TO_COUNTRY_NAME = {
+  al:"Albania",    am:"Armenia",    au:"Australia",  at:"Austria",
+  bh:"Bahrain",    be:"Belgique",   bg:"Bulgaria",   ca:"Canada",
+  cl:"Chile",      hr:"Croatia",    cy:"Cyprus",     cz:"Czech Republic",
+  dk:"Denmark",    do:"Dominican R.",ee:"Estonia",   fi:"Finland",
+  fr:"France",     de:"Germany",    gr:"Greece",     hk:"Hong Kong",
+  hu:"Hungary",    is:"Iceland",    in:"India",      ie:"Ireland",
+  il:"Israel",     it:"Italy",      jp:"Japan",      jo:"Jordan",
+  kz:"Kazakhstan", sa:"Saudi Arabia",kw:"Kuwait",    kg:"Kyrgyzstan",
+  lv:"Latvia",     lt:"Lithuania",  lu:"Luxembourg", mo:"Macao",
+  mk:"N. Macedonia",my:"Malaysia",  mt:"Malta",      md:"Moldova",
+  mc:"Monaco",     ma:"Morocco",    nl:"Netherlands",nz:"New Zealand",
+  no:"Norway",     ph:"Philippines",pl:"Poland",     pt:"Portugal",
+  qa:"Qatar",      ro:"Romania",    rs:"Serbia",     sg:"Singapore",
+  sk:"Slovakia",   si:"Slovenia",   za:"South Africa",kr:"Korea",
+  es:"Spain",      se:"Sweden",     ch:"Switzerland",tw:"Taiwan",
+  th:"Thailand",   tn:"Tunisia",    ae:"UAE",        gb:"UK",
+  uz:"Uzbekistan", vn:"Vietnam",
+};
+
 // Resolve Sales Org from a pricebook-id like "chl_be_eur_list" → "FRCH"
 function salesOrgFromPricebookId(pbId) {
   const m = pbId.match(/chl_([a-z]{2})_/i);
@@ -216,6 +237,8 @@ function parseSAP(arrayBuffer, refDate) {
 function parseSFCC(xmlText) {
   const doc = new DOMParser().parseFromString(xmlText, "text/xml");
   const pbId = doc.querySelector("header")?.getAttribute("pricebook-id") ?? "";
+  const m = pbId.match(/chl_([a-z]{2})_/i);
+  const countryCode = m ? m[1].toLowerCase() : null;
   const salesOrg = salesOrgFromPricebookId(pbId);
   const rawPrices = {};
 
@@ -235,7 +258,7 @@ function parseSFCC(xmlText) {
     rawPrices[pid].push({ price, from, to });
   });
 
-  return { pricebookId:pbId, salesOrg, rawPrices };
+  return { pricebookId:pbId, salesOrg, countryCode, rawPrices };
 }
 
 // ─── Multi-Pricebook Parser ───────────────────────────────────────────────────
@@ -259,6 +282,8 @@ function parseMultiPricebook(xmlText) {
   return pricebookEls.flatMap(pb => {
     const headerEl = getEls(pb, "header")[0];
     const pbId = headerEl?.getAttribute("pricebook-id") ?? "";
+    const mc2 = pbId.match(/chl_([a-z]{2})_/i);
+    const countryCode = mc2 ? mc2[1].toLowerCase() : null;
     const salesOrg = salesOrgFromPricebookId(pbId);
 
     const rawPrices = {};
@@ -285,6 +310,7 @@ function parseMultiPricebook(xmlText) {
     return [{
       pricebookId: pbId,
       salesOrg,
+      countryCode,
       rawPrices,
       entryCount: Object.keys(rawPrices).length,
       currency,
@@ -338,33 +364,50 @@ function resolveSFCCPrices(rawPrices, checkDate) {
 }
 
 // ─── Check Engine ─────────────────────────────────────────────────────────────
-function runChecks(sapData, sfccByOrg) {
-  return sapData.map(row => {
-    const sfcc = sfccByOrg[row.salesOrg] ?? {};
-    const isCW = row.category === CHILDRENWEAR;
-    let status = "KO_MISSING", sfccPrice = null, checkLevel = "", detail = "";
-
-    sfccPrice  = sfcc[row.article] ?? null;
-    checkLevel = (row.plc === "25" && !isCW) ? "Generic" : "SKU";
-
-    if (sfccPrice === null) {
-      status = "KO_MISSING";
-      detail = checkLevel === "Generic" ? "Generic absent SFCC" : "Absent SFCC";
-    } else if (row.price !== null && Math.abs(sfccPrice - row.price) < EPS) {
-      status = "PASS";
-    } else {
-      status = "KO_DIFF";
-      detail = row.price !== null ? `Prix différent — Δ ${(sfccPrice - row.price).toFixed(2)}` : "Prix SAP vide";
-    }
-
-    return { ...row, sfccPrice, status, checkLevel, detail };
+// sfccByCountry : { [countryCode]: { [article]: price } }
+// countryToSalesOrg : { [countryCode]: salesOrg }
+// Produces one result per (country × SAP row) — France and Belgium both see
+// the FRCH SAP articles but are checked against their own SFCC pricebook.
+function runChecks(sapData, sfccByCountry, countryToSalesOrg) {
+  // Reverse map: salesOrg → [countryCode]
+  const orgToCountries = {};
+  Object.entries(countryToSalesOrg).forEach(([cc, org]) => {
+    if (!orgToCountries[org]) orgToCountries[org] = [];
+    orgToCountries[org].push(cc);
   });
+
+  const results = [];
+  sapData.forEach(row => {
+    const countries = orgToCountries[row.salesOrg] ?? [];
+    countries.forEach(countryCode => {
+      const sfcc   = sfccByCountry[countryCode] ?? {};
+      const isCW   = row.category === CHILDRENWEAR;
+      let status = "KO_MISSING", sfccPrice = null, checkLevel = "", detail = "";
+
+      sfccPrice  = sfcc[row.article] ?? null;
+      checkLevel = (row.plc === "25" && !isCW) ? "Generic" : "SKU";
+
+      if (sfccPrice === null) {
+        status = "KO_MISSING";
+        detail = checkLevel === "Generic" ? "Generic absent SFCC" : "Absent SFCC";
+      } else if (row.price !== null && Math.abs(sfccPrice - row.price) < EPS) {
+        status = "PASS";
+      } else {
+        status = "KO_DIFF";
+        detail = row.price !== null ? `Prix différent — Δ ${(sfccPrice - row.price).toFixed(2)}` : "Prix SAP vide";
+      }
+
+      results.push({ ...row, country: countryCode, sfccPrice, status, checkLevel, detail });
+    });
+  });
+  return results;
 }
 
 // ─── Export ───────────────────────────────────────────────────────────────────
 function toExportRows(rows, checkDateLabel) {
   return rows.map(r => ({
     "Date de check":         checkDateLabel,
+    "Pays":                  ISO_TO_COUNTRY_NAME[r.country] || r.country || "",
     "Sales Org":             r.salesOrg,
     "Article":               r.article,
     "Pricing Ref (Generic)": r.pricingRef ?? "",
@@ -799,20 +842,23 @@ function PriceCheckerV2() {
           }
         }
 
-        // ── SFCC DQ: resolve prices, collect overlaps per Sales Org ──
-        const sfccByOrg  = {};
+        // ── SFCC DQ + build per-country price maps ──
+        const sfccByCountry    = {};
+        const countryToSalesOrg = {};
         const allDqIssues = [];
         xmlFiles.forEach(x => {
           const org = x.salesOrgOverride || x.salesOrg;
-          if (!org) return;
+          const cc  = x.countryCode;
+          if (!org || !cc) return;
           const { prices, dqIssues } = resolveSFCCPrices(x.rawPrices, refDate);
-          sfccByOrg[org] = prices;
-          dqIssues.forEach(issue => allDqIssues.push({ ...issue, salesOrg: org }));
+          sfccByCountry[cc]    = prices;
+          countryToSalesOrg[cc] = org;
+          dqIssues.forEach(issue => allDqIssues.push({ ...issue, country: cc, salesOrg: org }));
         });
         setDqIssues(allDqIssues);
 
         // Run checks on de-duplicated SAP data
-        setResults(runChecks(dedupedSapData, sfccByOrg));
+        setResults(runChecks(dedupedSapData, sfccByCountry, countryToSalesOrg));
         setAppliedDate(refDate);
         setFilterOrg("all"); setFilterStatus("all"); setSearch(""); setPage(0);
         setError("");
@@ -888,19 +934,22 @@ function PriceCheckerV2() {
           }
         }
 
-        // SFCC — from selected pricebooks
-        const sfccByOrg = {};
+        // SFCC — from selected pricebooks, per country
+        const sfccByCountry    = {};
+        const countryToSalesOrg = {};
         const allDqIssues = [];
         activePbs.forEach(pb => {
           const org = orgOverrides[pb.pricebookId] || pb.salesOrg;
-          if (!org) return;
+          const cc  = pb.countryCode;
+          if (!org || !cc) return;
           const { prices, dqIssues } = resolveSFCCPrices(pb.rawPrices, refDate);
-          sfccByOrg[org] = prices;
-          dqIssues.forEach(issue => allDqIssues.push({ ...issue, salesOrg: org }));
+          sfccByCountry[cc]    = prices;
+          countryToSalesOrg[cc] = org;
+          dqIssues.forEach(issue => allDqIssues.push({ ...issue, country: cc, salesOrg: org }));
         });
         setDqIssues(allDqIssues);
 
-        setResults(runChecks(dedupedSapData, sfccByOrg));
+        setResults(runChecks(dedupedSapData, sfccByCountry, countryToSalesOrg));
         setAppliedDate(refDate);
         setFilterOrg("all"); setFilterStatus("all"); setSearch(""); setPage(0);
         setError("");
@@ -911,12 +960,15 @@ function PriceCheckerV2() {
 
   const stats = useMemo(() => {
     if (!results) return null;
-    const orgs = [...new Set(results.map(r=>r.salesOrg))].sort();
+    // Group by country (ISO code), sorted by display name
+    const orgs = [...new Set(results.map(r => r.country))].sort((a,b) =>
+      (ISO_TO_COUNTRY_NAME[a]||a).localeCompare(ISO_TO_COUNTRY_NAME[b]||b)
+    );
     const byOrg = {};
-    orgs.forEach(org => {
-      const cr = results.filter(r=>r.salesOrg===org);
-      byOrg[org] = { total:cr.length, pass:cr.filter(r=>r.status==="PASS").length, koDiff:cr.filter(r=>r.status==="KO_DIFF").length, koMiss:cr.filter(r=>r.status==="KO_MISSING").length };
-      byOrg[org].ko = byOrg[org].koDiff + byOrg[org].koMiss;
+    orgs.forEach(cc => {
+      const cr = results.filter(r => r.country === cc);
+      byOrg[cc] = { total:cr.length, pass:cr.filter(r=>r.status==="PASS").length, koDiff:cr.filter(r=>r.status==="KO_DIFF").length, koMiss:cr.filter(r=>r.status==="KO_MISSING").length };
+      byOrg[cc].ko = byOrg[cc].koDiff + byOrg[cc].koMiss;
     });
     const pass=results.filter(r=>r.status==="PASS").length, koDiff=results.filter(r=>r.status==="KO_DIFF").length, koMiss=results.filter(r=>r.status==="KO_MISSING").length;
     return { total:results.length, pass, koDiff, koMiss, ko:koDiff+koMiss, orgs, byOrg };
@@ -936,9 +988,9 @@ function PriceCheckerV2() {
     if (!results) return [];
     return results.filter(r => {
       const ps = filterStatus==="all"?true:filterStatus==="KO"?(r.status==="KO_DIFF"||r.status==="KO_MISSING"):r.status===filterStatus;
-      if (filterOrg!=="all" && r.salesOrg!==filterOrg) return false;
+      if (filterOrg!=="all" && r.country!==filterOrg) return false;
       if (!ps) return false;
-      if (search) { const q=search.toLowerCase(); if (!r.article.toLowerCase().includes(q)&&!r.salesOrg.toLowerCase().includes(q)) return false; }
+      if (search) { const q=search.toLowerCase(); const cname=(ISO_TO_COUNTRY_NAME[r.country]||r.country||"").toLowerCase(); if (!r.article.toLowerCase().includes(q)&&!cname.includes(q)&&!r.salesOrg.toLowerCase().includes(q)) return false; }
       return true;
     });
   }, [results, filterOrg, filterStatus, search]);
@@ -1448,7 +1500,7 @@ function PriceCheckerV2() {
                       <div style={{ display:"flex", flexWrap:"wrap", gap:"4px" }}>
                         {diff.slice(0,30).map(d => (
                           <span key={d.pid+d.salesOrg} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#1e0a0a", border:"1px solid #E0525255", color:"#E05252", padding:"3px 8px" }} title={d.entries.map(e=>`${e.price} (${fmtDate(e.from)}→${fmtDate(e.to)})`).join(" | ")}>
-                            {d.salesOrg} · {d.pid}
+                            {ISO_TO_COUNTRY_NAME[d.country]||d.salesOrg} · {d.pid}
                             <span style={{ color:"#E0525288", marginLeft:"4px", fontSize:"8px" }}>
                               {d.entries.map(e=>fmt(e.price)).join(" / ")}
                             </span>
@@ -1467,8 +1519,8 @@ function PriceCheckerV2() {
                       </div>
                       <div style={{ display:"flex", flexWrap:"wrap", gap:"4px" }}>
                         {same.slice(0,30).map(d => (
-                          <span key={d.pid+d.salesOrg} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#111", border:"1px solid #C9A97A22", color:"#C9A97A77", padding:"3px 8px" }}>
-                            {d.salesOrg} · {d.pid}
+                          <span key={d.pid+(d.country||d.salesOrg)} style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", background:"#111", border:"1px solid #C9A97A22", color:"#C9A97A77", padding:"3px 8px" }}>
+                            {ISO_TO_COUNTRY_NAME[d.country]||d.salesOrg} · {d.pid}
                           </span>
                         ))}
                         {same.length > 30 && <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#555" }}>+{same.length-30} autres</span>}
@@ -1483,17 +1535,20 @@ function PriceCheckerV2() {
               <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"11px" }}>
                 <thead>
                   <tr style={{ background:"#0c0c0c", borderBottom:"1px solid #1a1a1a" }}>
-                    {["Sales Org","Vérifiés","PASS","KO total","dont prix diff.","dont absents SFCC"].map(h=>(
+                    {["Pays","Sales Org","Vérifiés","PASS","KO total","dont prix diff.","dont absents SFCC"].map(h=>(
                       <th key={h} style={{ padding:"7px 12px", fontFamily:"'Montserrat',sans-serif", fontSize:"8px", letterSpacing:".12em", color:"#C9A97A", textTransform:"uppercase", fontWeight:500, textAlign:"left" }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {stats.orgs.map(org=>{
-                    const o=stats.byOrg[org];
+                  {stats.orgs.map(cc=>{
+                    const o=stats.byOrg[cc];
+                    const name=ISO_TO_COUNTRY_NAME[cc]||cc.toUpperCase();
+                    const org=COUNTRY_TO_SALESORG[cc]||"";
                     return (
-                      <tr key={org} className="tr" style={{ cursor:"pointer" }} onClick={()=>{setFilterOrg(org);setPage(0);}}>
-                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:"#C9A97A" }}>{org}</td>
+                      <tr key={cc} className="tr" style={{ cursor:"pointer" }} onClick={()=>{setFilterOrg(cc);setPage(0);}}>
+                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:"#F0EBE0" }}>{name}</td>
+                        <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:"#C9A97A88", fontSize:"10px" }}>{org}</td>
                         <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:"#888" }}>{o.total.toLocaleString()}</td>
                         <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:"#4CAF7A" }}>{o.pass.toLocaleString()}</td>
                         <td style={{ padding:"6px 12px", fontFamily:"'Montserrat',sans-serif", color:o.ko>0?"#E05252":"#333", fontWeight:o.ko>0?500:300 }}>{o.ko.toLocaleString()}</td>
@@ -1508,8 +1563,8 @@ function PriceCheckerV2() {
 
             <div style={{ display:"flex", gap:"6px", marginBottom:"10px", flexWrap:"wrap", alignItems:"center" }}>
               <select className="sel" value={filterOrg} onChange={e=>{setFilterOrg(e.target.value);setPage(0);}}>
-                <option value="all">Toutes Sales Org</option>
-                {stats.orgs.map(o=><option key={o} value={o}>{o}</option>)}
+                <option value="all">Tous les pays</option>
+                {stats.orgs.map(cc=><option key={cc} value={cc}>{ISO_TO_COUNTRY_NAME[cc]||cc.toUpperCase()} ({COUNTRY_TO_SALESORG[cc]||"?"})</option>)}
               </select>
               <div style={{ display:"flex", gap:"5px", flexWrap:"wrap" }}>
                 {[
@@ -1531,7 +1586,7 @@ function PriceCheckerV2() {
               <table style={{ width:"100%", borderCollapse:"collapse", fontSize:"12px" }}>
                 <thead style={{ position:"sticky", top:0, zIndex:1 }}>
                   <tr style={{ background:"#0c0c0c", borderBottom:"1px solid #222" }}>
-                    {["Sales Org","Article","PricingRef","PLC","Catégorie","SAP Prix","Devise","SFCC Prix","Niveau","Status","Détail"].map(h=>(
+                    {["Pays","Sales Org","Article","PricingRef","PLC","Catégorie","SAP Prix","Devise","SFCC Prix","Niveau","Status","Détail"].map(h=>(
                       <th key={h} style={{ padding:"8px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"8px", letterSpacing:".12em", color:"#C9A97A", textTransform:"uppercase", fontWeight:500, textAlign:"left", whiteSpace:"nowrap" }}>{h}</th>
                     ))}
                   </tr>
@@ -1539,7 +1594,8 @@ function PriceCheckerV2() {
                 <tbody>
                   {paged.map((row,i)=>(
                     <tr key={i} className="tr">
-                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#C9A97A88", whiteSpace:"nowrap" }}>{row.salesOrg}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#F0EBE0", whiteSpace:"nowrap" }}>{ISO_TO_COUNTRY_NAME[row.country]||row.country||"—"}</td>
+                      <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#C9A97A55", whiteSpace:"nowrap" }}>{row.salesOrg}</td>
                       <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"11px", color:"#ddd", whiteSpace:"nowrap" }}>{row.article}</td>
                       <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#555", whiteSpace:"nowrap" }}>{row.pricingRef??"—"}</td>
                       <td style={{ padding:"7px 11px", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:row.plc==="25"?"#C9A97A":"#a07de0" }}>{row.plc}</td>
@@ -1555,7 +1611,7 @@ function PriceCheckerV2() {
                     </tr>
                   ))}
                   {paged.length===0 && (
-                    <tr><td colSpan={11} style={{ padding:"40px", textAlign:"center", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#1a1a1a", letterSpacing:".2em", textTransform:"uppercase" }}>Aucun résultat</td></tr>
+                    <tr><td colSpan={12} style={{ padding:"40px", textAlign:"center", fontFamily:"'Montserrat',sans-serif", fontSize:"10px", color:"#1a1a1a", letterSpacing:".2em", textTransform:"uppercase" }}>Aucun résultat</td></tr>
                   )}
                 </tbody>
               </table>
