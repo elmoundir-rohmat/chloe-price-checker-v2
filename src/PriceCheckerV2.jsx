@@ -5,6 +5,30 @@ const CHILDRENWEAR = "Childrenwear Chloé";
 const EPS = 0.01;
 const PAGE_SIZE = 200;
 
+// ─── Country ISO code → SAP Sales Org mapping ────────────────────────────────
+// Source: Classeur2.xlsx — a SFCC pricebook like chl_be_eur_list (Belgium)
+// must resolve to FRCH, not BECH (which doesn't exist in SAP).
+const COUNTRY_TO_SALESORG = {
+  al:"FRCH", am:"FRCH", au:"AUCH", at:"FRCH", bh:"AECH", be:"FRCH",
+  bg:"FRCH", ca:"CACH", cl:"USCH", hr:"FRCH", cy:"FRCH", cz:"FRCH",
+  dk:"FRCH", do:"USCH", ee:"FRCH", fi:"FRCH", fr:"FRCH", de:"DECH",
+  gr:"FRCH", hk:"HKCH", hu:"FRCH", is:"FRCH", in:"USCH", ie:"FRCH",
+  il:"USCH", it:"ITCH", jp:"JPCH", jo:"USCH", kz:"FRCH", sa:"SACH",
+  kw:"KWCH", kg:"FRCH", lv:"FRCH", lt:"FRCH", lu:"FRCH", mo:"MOCH",
+  mk:"FRCH", my:"MYCH", mt:"FRCH", md:"FRCH", mc:"FRCH", ma:"FRCH",
+  nl:"NLCH", nz:"NZCH", no:"FRCH", ph:"PHCH", pl:"FRCH", pt:"FRCH",
+  qa:"AECH", ro:"FRCH", rs:"FRCH", sg:"SGCH", sk:"FRCH", si:"FRCH",
+  za:"USCH", kr:"KRCH", es:"ESCH", se:"FRCH", ch:"CHCH", tw:"TWCH",
+  th:"THCH", tn:"FRCH", ae:"AECH", gb:"GBCH", uz:"FRCH", vn:"VNCH",
+};
+
+// Resolve Sales Org from a pricebook-id like "chl_be_eur_list" → "FRCH"
+function salesOrgFromPricebookId(pbId) {
+  const m = pbId.match(/chl_([a-z]{2})_/i);
+  if (!m) return null;
+  return COUNTRY_TO_SALESORG[m[1].toLowerCase()] ?? null;
+}
+
 // ─── Column mapping ───────────────────────────────────────────────────────────
 // Maps internal field names to possible header labels in the SAP Excel.
 // Add synonyms/variants here if SAP changes the column name in future exports.
@@ -163,8 +187,7 @@ function parseSAP(arrayBuffer, refDate) {
 function parseSFCC(xmlText) {
   const doc = new DOMParser().parseFromString(xmlText, "text/xml");
   const pbId = doc.querySelector("header")?.getAttribute("pricebook-id") ?? "";
-  const m = pbId.match(/chl_([a-z]{2})_/i);
-  const salesOrg = m ? m[1].toUpperCase()+"CH" : null;
+  const salesOrg = salesOrgFromPricebookId(pbId);
   const rawPrices = {};
 
   doc.querySelectorAll("price-table").forEach(t => {
@@ -207,8 +230,7 @@ function parseMultiPricebook(xmlText) {
   return pricebookEls.map(pb => {
     const headerEl = getEls(pb, "header")[0];
     const pbId = headerEl?.getAttribute("pricebook-id") ?? "";
-    const m = pbId.match(/chl_([a-z]{2})_/i);
-    const salesOrg = m ? m[1].toUpperCase() + "CH" : null;
+    const salesOrg = salesOrgFromPricebookId(pbId);
 
     const rawPrices = {};
     getEls(pb, "price-table").forEach(t => {
