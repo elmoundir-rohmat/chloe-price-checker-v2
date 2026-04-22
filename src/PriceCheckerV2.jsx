@@ -20,6 +20,8 @@ const COUNTRY_TO_SALESORG = {
   qa:"AECH", ro:"FRCH", rs:"FRCH", sg:"SGCH", sk:"FRCH", si:"FRCH",
   za:"USCH", kr:"KRCH", es:"ESCH", se:"FRCH", ch:"CHCH", tw:"TWCH",
   th:"THCH", tn:"FRCH", ae:"AECH", gb:"GBCH", uz:"FRCH", vn:"VNCH",
+  // Additional countries not in Classeur2.xlsx but present in SFCC/SAP
+  us:"USCH", ru:"RUCH", id:"IDCH", cn:"CNCH",
 };
 
 // Target currency per country ISO code (from Classeur2.xlsx "Currency cible")
@@ -35,6 +37,7 @@ const COUNTRY_TO_CURRENCY = {
   qa:"AED", ro:"EUR", rs:"EUR", sg:"SGD", sk:"EUR", si:"EUR",
   za:"USD", kr:"KRW", es:"EUR", se:"EUR", ch:"CHF", tw:"TWD",
   th:"THB", tn:"EUR", ae:"AED", gb:"GBP", uz:"EUR", vn:"USD",
+  us:"USD", ru:"RUB", id:"IDR", cn:"CNY",
 };
 
 // Country display names (for KPI table + filters)
@@ -56,6 +59,7 @@ const ISO_TO_COUNTRY_NAME = {
   es:"Spain",      se:"Sweden",     ch:"Switzerland",tw:"Taiwan",
   th:"Thailand",   tn:"Tunisia",    ae:"UAE",        gb:"UK",
   uz:"Uzbekistan", vn:"Vietnam",
+  us:"USA",        ru:"Russia",     id:"Indonesia",  cn:"China",
 };
 
 // Resolve Sales Org from a pricebook-id like "chl_be_eur_list" → "FRCH"
