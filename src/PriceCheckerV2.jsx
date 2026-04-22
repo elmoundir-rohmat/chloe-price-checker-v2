@@ -22,11 +22,40 @@ const COUNTRY_TO_SALESORG = {
   th:"THCH", tn:"FRCH", ae:"AECH", gb:"GBCH", uz:"FRCH", vn:"VNCH",
 };
 
+// Target currency per country ISO code (from Classeur2.xlsx "Currency cible")
+const COUNTRY_TO_CURRENCY = {
+  al:"EUR", am:"EUR", au:"AUD", at:"EUR", bh:"AED", be:"EUR",
+  bg:"EUR", ca:"CAD", cl:"USD", hr:"EUR", cy:"EUR", cz:"EUR",
+  dk:"EUR", do:"USD", ee:"EUR", fi:"EUR", fr:"EUR", de:"EUR",
+  gr:"EUR", hk:"HKD", hu:"EUR", is:"EUR", in:"USD", ie:"EUR",
+  il:"USD", it:"EUR", jp:"JPY", jo:"USD", kz:"EUR", sa:"SAR",
+  kw:"KWD", kg:"EUR", lv:"EUR", lt:"EUR", lu:"EUR", mo:"MOP",
+  mk:"EUR", my:"MYR", mt:"EUR", md:"EUR", mc:"EUR", ma:"EUR",
+  nl:"EUR", nz:"NZD", no:"EUR", ph:"PHP", pl:"EUR", pt:"EUR",
+  qa:"AED", ro:"EUR", rs:"EUR", sg:"SGD", sk:"EUR", si:"EUR",
+  za:"USD", kr:"KRW", es:"EUR", se:"EUR", ch:"CHF", tw:"TWD",
+  th:"THB", tn:"EUR", ae:"AED", gb:"GBP", uz:"EUR", vn:"USD",
+};
+
 // Resolve Sales Org from a pricebook-id like "chl_be_eur_list" → "FRCH"
 function salesOrgFromPricebookId(pbId) {
   const m = pbId.match(/chl_([a-z]{2})_/i);
   if (!m) return null;
   return COUNTRY_TO_SALESORG[m[1].toLowerCase()] ?? null;
+}
+
+// Extract currency code from pricebook-id: "chl_kw_kwd_list" → "KWD"
+function currencyFromPricebookId(pbId) {
+  const m = pbId.match(/chl_[a-z]{2}_([a-z]+)_/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// Returns true if the pricebook's currency matches the target currency for its country
+function isTargetCurrency(pbId) {
+  const mc = pbId.match(/chl_([a-z]{2})_([a-z]+)_/i);
+  if (!mc) return true; // can't determine → keep
+  const target = COUNTRY_TO_CURRENCY[mc[1].toLowerCase()];
+  return !target || mc[2].toUpperCase() === target;
 }
 
 // ─── Column mapping ───────────────────────────────────────────────────────────
@@ -249,11 +278,14 @@ function parseMultiPricebook(xmlText) {
       rawPrices[pid].push({ price, from, to });
     });
 
+    const currency = currencyFromPricebookId(pbId);
     return {
       pricebookId: pbId,
       salesOrg,
       rawPrices,
       entryCount: Object.keys(rawPrices).length,
+      currency,
+      isTargetCcy: isTargetCurrency(pbId),
     };
   });
 }
@@ -683,7 +715,9 @@ function PriceCheckerV2() {
         const pbs = parseMultiPricebook(ev.target.result);
         if (!pbs.length) throw new Error("Aucun pricebook trouvé dans le fichier.");
         setSplitResult(pbs);
-        setSelectedPbs(new Set(pbs.map(p => p.pricebookId)));
+        // Pre-check only pricebooks whose currency matches the target currency
+        // (e.g. for Kuwait: KWD ✅ pre-checked, USD ❌ pre-unchecked)
+        setSelectedPbs(new Set(pbs.filter(p => p.isTargetCcy).map(p => p.pricebookId)));
         setOrgOverrides({});
       } catch(err) { setError("Erreur XML : " + err.message); }
     };
@@ -1172,6 +1206,13 @@ function PriceCheckerV2() {
                                 style={{ width:"70px" }}
                               />
                             </div>
+
+                            {/* Currency badge */}
+                            {pb.currency && (
+                              <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"8px", padding:"2px 6px", background: pb.isTargetCcy ? "#0a1e0f" : "#1e1000", border:`1px solid ${pb.isTargetCcy ? "#2a4a2a" : "#4a2a00"}`, color: pb.isTargetCcy ? "#4CAF7A" : "#F0A030" }}>
+                                {pb.currency}{!pb.isTargetCcy && " ⚠ devise non cible"}
+                              </span>
+                            )}
 
                             {/* Entry count */}
                             <span style={{ fontFamily:"'Montserrat',sans-serif", fontSize:"9px", color:"#444", marginLeft:"auto" }}>
